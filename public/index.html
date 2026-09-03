@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>
+      抖音-EXT
+    </title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <!-- 顶部操作区：同步在 Chrome 中的抖音页面，结果显示在下方。 -->
+      <header class="topbar">
+        <div class="topbar-actions">
+          <label class="concurrency-control" for="download-quality">
+            清晰度
+            <select id="download-quality" aria-label="下载清晰度">
+              <option value="highest" selected>
+                最高
+              </option>
+              <option value="standard">
+                标准
+              </option>
+            </select>
+          </label>
+          <label class="concurrency-control" for="download-concurrency">
+            并发
+            <select id="download-concurrency" aria-label="下载并发数">
+              <option value="1">
+                1
+              </option>
+              <option value="2" selected>
+                2
+              </option>
+              <option value="3">
+                3
+              </option>
+              <option value="4">
+                4
+              </option>
+              <option value="5">
+                5
+              </option>
+              <option value="6">
+                6
+              </option>
+              <option value="7">
+                7
+              </option>
+              <option value="8">
+                8
+              </option>
+              <option value="9">
+                9
+              </option>
+              <option value="10">
+                10
+              </option>
+            </select>
+          </label>
+          <button id="download-all" class="secondary" disabled>
+            下载全部作品
+          </button>
+          <button id="download-specified" class="secondary" type="button">
+            下载指定
+          </button>
+          <button id="sync" class="primary">
+            从抖音同步
+          </button>
+        </div>
+      </header>
+      <!-- 同步开始后才展示状态和动态进度，避免首页默认占用一块空白区域。 -->
+      <section class="status" id="sync-status" hidden>
+        <div class="status-heading">
+          <div id="status">
+            等待同步。请先在 Chrome 中打开抖音个人页。
+          </div>
+          <button id="sync-status-close" class="status-close" type="button" hidden>
+            关闭
+          </button>
+        </div>
+        <div class="progress-track" id="progress-track" hidden>
+          <div class="progress-value" id="progress-value">
+          </div>
+        </div>
+        <div class="progress-detail" id="progress-detail">
+        </div>
+      </section>
+      <section class="download-status" id="download-status" hidden>
+        <div class="download-header">
+          <strong id="download-title">
+            批量下载
+          </strong>
+          <span id="download-summary">
+          </span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-value" id="download-progress-value">
+          </div>
+        </div>
+        <div class="download-detail" id="download-detail">
+        </div>
+        <div id="download-active-list" class="download-active-list" aria-live="polite">
+        </div>
+        <div class="download-actions">
+          <button id="download-pause" type="button">
+            暂停
+          </button>
+          <button id="download-resume" type="button" hidden>
+            继续
+          </button>
+          <button id="download-retry" type="button" hidden>
+            重试失败项
+          </button>
+          <button id="download-cancel" type="button">
+            取消
+          </button>
+          <button id="download-status-close" class="status-close" type="button" hidden>
+            关闭
+          </button>
+        </div>
+      </section>
+      <!-- 两个数据源只在前端切换，避免重复抓取。 -->
+      <nav class="tabs" aria-label="内容类型">
+        <button class="tab active" data-source="like">
+          喜欢
+          <span id="like-count">
+            0
+          </span>
+        </button>
+        <button class="tab" data-source="collect">
+          收藏
+          <span id="collect-count">
+            0
+          </span>
+        </button>
+      </nav>
+      <!-- 搜索和排序作用于当前标签；“列表顺序”保持抖音页面顺序。 -->
+      <section class="toolbar">
+        <label class="search">
+          <span>
+            ⌕
+          </span>
+          <input id="search" placeholder="搜索标题或作者" />
+        </label>
+        <select id="sort">
+          <option value="saved">
+            列表顺序
+          </option>
+          <option value="newest">
+            作品发布时间（新）
+          </option>
+          <option value="oldest">
+            作品发布时间（旧）
+          </option>
+          <option value="likes">
+            获赞最多
+          </option>
+          <option value="duration">
+            时长最长
+          </option>
+        </select>
+      </section>
+      <!-- 卡片和分页由 app.js 根据当前状态渲染。 -->
+      <section id="grid" class="grid" aria-live="polite">
+      </section>
+      <nav id="pagination" class="pagination" aria-label="分页">
+      </nav>
+    </main>
+    <dialog id="download-confirm-modal" class="download-confirm-modal" aria-labelledby="download-confirm-title">
+      <button id="download-confirm-close" class="modal-close" type="button" aria-label="关闭确认窗口">
+        ×
+      </button>
+      <div class="download-confirm-content">
+        <p class="modal-label">
+          批量下载
+        </p>
+        <h2 id="download-confirm-title">
+          准备下载喜欢的作品
+        </h2>
+        <p class="download-confirm-description">
+          视频保存为 MP4，图集会建立独立文件夹保存全部图片。任务会在后台运行，页面关闭后也不会中断。
+        </p>
+        <div class="download-confirm-summary">
+          <div>
+            <strong id="download-confirm-video-count">
+              0
+            </strong>
+            <span>
+              个视频
+            </span>
+          </div>
+          <div>
+            <strong id="download-confirm-image-count">
+              0
+            </strong>
+            <span>
+              个图集
+            </span>
+          </div>
+          <div>
+            <strong id="download-confirm-quality">
+              最高
+            </strong>
+            <span>
+              清晰度
+            </span>
+          </div>
+          <div>
+            <strong id="download-confirm-concurrency">
+              2
+            </strong>
+            <span>
+              个并发
+            </span>
+          </div>
+        </div>
+        <p id="download-confirm-directory" class="download-confirm-directory">
+        </p>
+        <div class="download-confirm-actions">
+          <button id="download-confirm-cancel" type="button">
+            取消
+          </button>
+          <button id="download-confirm-start" class="primary" type="button">
+            开始下载
+          </button>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="specified-download-modal" class="download-confirm-modal specified-download-modal" aria-labelledby="specified-download-title">
+      <button id="specified-download-close" class="modal-close" type="button" aria-label="关闭指定下载窗口">
+        ×
+      </button>
+      <div class="download-confirm-content">
+        <p class="modal-label">
+          指定下载
+        </p>
+        <h2 id="specified-download-title">
+          输入抖音作品链接
+        </h2>
+        <p class="download-confirm-description">
+          解析后会打开作品详情，可以预览、切换清晰度并下载。
+        </p>
+        <label class="specified-download-field" for="specified-download-url">
+          <span>
+            作品链接
+          </span>
+          <input id="specified-download-url" type="url" autocomplete="off" placeholder="https://www.douyin.com/video/作品ID" />
+        </label>
+        <p id="specified-download-error" class="specified-download-error" role="alert">
+        </p>
+        <div class="download-confirm-actions">
+          <button id="specified-download-cancel" type="button">
+            取消
+          </button>
+          <button id="specified-download-open" class="primary" type="button">
+            解析并打开
+          </button>
+        </div>
+      </div>
+    </dialog>
+    <!-- 作品详情在本地弹窗中展示，视频地址由点击时实时请求抖音详情接口。 -->
+    <dialog id="video-modal" class="video-modal" aria-labelledby="modal-title">
+      <button id="modal-close" class="modal-close" type="button" aria-label="关闭详情">
+        ×
+      </button>
+      <div class="modal-layout">
+        <div class="player-panel">
+          <div id="modal-player" class="modal-player">
+            <div id="modal-loading" class="modal-loading">
+              正在获取视频...
+            </div>
+            <video id="modal-video" controls loop playsinline preload="metadata" hidden>
+            </video>
+            <audio id="modal-audio" preload="metadata" hidden>
+            </audio>
+            <div id="modal-images" class="modal-images" hidden>
+              <button id="modal-image-prev" class="image-nav image-nav-prev" type="button" aria-label="上一张图片">
+                &#8249;
+              </button>
+              <div class="modal-image-stage">
+                <img id="modal-image" alt="" tabindex="0" role="button" aria-label="点击放大图片" />
+              </div>
+              <button id="modal-image-next" class="image-nav image-nav-next" type="button" aria-label="下一张图片">
+                &#8250;
+              </button>
+              <span id="modal-image-count" class="modal-image-count" aria-live="polite">
+              </span>
+              <div class="image-actions">
+                <button id="modal-image-download-current" type="button">
+                  下载当前
+                </button>
+                <button id="modal-image-download-all" type="button">
+                  下载全部
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <aside class="modal-info">
+          <p class="modal-label">
+            实时作品详情
+          </p>
+          <div class="author-profile">
+            <img id="modal-author-avatar" class="author-avatar" alt="" hidden>
+            <div class="author-copy">
+              <a id="modal-author-name" class="modal-author-name" target="_blank" rel="noopener noreferrer">
+              </a>
+              <p id="modal-author" class="modal-author">
+              </p>
+            </div>
+          </div>
+          <div id="modal-author-stats" class="author-stats">
+          </div>
+          <p id="modal-author-signature" class="author-signature">
+          </p>
+          <p id="modal-author-extra" class="author-extra">
+          </p>
+          <div class="modal-divider">
+          </div>
+          <h2 id="modal-title">
+          </h2>
+          <div id="modal-meta" class="modal-meta">
+          </div>
+          <a id="modal-original-link" class="modal-original-link" target="_blank" rel="noopener noreferrer" hidden>
+            打开原作品
+          </a>
+          <div id="modal-actions" class="modal-actions" hidden>
+            <label class="quality-control" for="modal-quality">
+              <span>
+                清晰度
+              </span>
+              <select id="modal-quality" disabled>
+                <option>
+                  获取中...
+                </option>
+              </select>
+            </label>
+            <button id="modal-download" class="modal-download" type="button" disabled>
+              下载当前清晰度
+            </button>
+          </div>
+          <p id="modal-date" class="modal-date">
+          </p>
+          <p id="modal-music" class="modal-music">
+          </p>
+          <p id="modal-tags" class="modal-tags">
+          </p>
+          <p id="modal-location" class="modal-location">
+          </p>
+          <p id="modal-technical" class="modal-technical">
+          </p>
+          <p id="modal-error" class="modal-error" role="alert">
+          </p>
+        </aside>
+      </div>
+    </dialog>
+    <!-- 图集图片放大预览层。 -->
+    <dialog id="image-lightbox" class="image-lightbox" aria-label="放大图片">
+      <button id="image-lightbox-close" class="modal-close" type="button" aria-label="关闭图片预览">
+        ×
+      </button>
+      <div class="image-lightbox-toolbar" aria-label="图片缩放">
+        <button id="image-lightbox-zoom-out" type="button" title="缩小图片" aria-label="缩小图片">
+          -
+        </button>
+        <button id="image-lightbox-zoom-reset" class="image-lightbox-zoom-reset" type="button" title="恢复适应大小" aria-label="恢复适应大小">
+          100%
+        </button>
+        <button id="image-lightbox-zoom-in" type="button" title="放大图片" aria-label="放大图片">
+          +
+        </button>
+      </div>
+      <img id="image-lightbox-image" alt="" />
+    </dialog>
+    <script src="/app.js">
+    </script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>抖音-EXT</title>
+  <rect width="64" height="64" rx="15" fill="#147d92"/>
+  <!-- 用青色和红色错位层模拟抖音音符的立体边缘。 -->
+  <path fill="#25f4ee" d="M33 12h8v26.2a10 10 0 1 1-8-9.7V12Zm8 0h7l9 6v8l-9-6v-8Z"/>
+  <path fill="#fe2c55" d="M29 15h8v26.2a10 10 0 1 1-8-9.7V15Zm8 0h7l9 6v8l-9-6v-8Z"/>
+  <path fill="#fff" d="M31 13h8v26.2a10 10 0 1 1-8-9.7V13Zm8 0h7l9 6v8l-9-6v-8Z"/>
+</svg>
