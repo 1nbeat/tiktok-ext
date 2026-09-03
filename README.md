@@ -4,6 +4,10 @@
 
 项目通过 Chrome DevTools Protocol（CDP）连接已经登录抖音的 Chrome 页面，在页面上下文中调用抖音接口，同步“喜欢”和“收藏”列表。同步结果展示在本地 Web 页面中，可以查看作品详情、播放视频、切换清晰度、浏览图集，也可以批量下载全部喜欢作品。
 
+<img width="2559" height="1386" alt="image" src="https://github.com/user-attachments/assets/9b28cced-7f6d-4186-9712-b31c03a66e17" />
+<img width="2559" height="1386" alt="image" src="https://github.com/user-attachments/assets/87bfcd49-6529-42f7-9d5d-32bf6464b63b" />
+<img width="2559" height="1387" alt="image" src="https://github.com/user-attachments/assets/52061088-2aa6-44bc-ac61-99f68ec524ba" />
+
 ## 功能概览
 
 - 同步抖音个人页中的喜欢和收藏作品。
