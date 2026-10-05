@@ -1491,7 +1491,9 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/api/sync') return send(res, 200, JSON.stringify(latestData));
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const sourceItems = Array.isArray(latestData.like) ? latestData.like : [];
+      const source = ['like', 'collect', 'user'].includes(body.source) ? body.source : 'like';
+      const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户' };
+      const sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
       const items = sourceItems.filter(item => /^\d+$/.test(String(item.id)))
         .map(item => ({
           id: String(item.id), title: item.title || '', author: item.author || '',
@@ -1500,11 +1502,11 @@ const server = http.createServer(async (req, res) => {
           images: Array.isArray(item.images) ? item.images.filter(isDouyinMediaUrl) : [],
           status: 'pending', bytes: 0, totalBytes: 0, attempts: 0, error: null, path: ''
         }));
-      if (!items.length) return send(res, 400, JSON.stringify({ error: '没有可下载的喜欢作品，请先完成同步' }));
+      if (!items.length) return send(res, 400, JSON.stringify({ error: `没有可下载的${sourceLabels[source]}作品，请先完成同步` }));
       const job = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-        source: 'like', quality: body.quality === 'standard' ? 'standard' : 'highest',
+        source, quality: body.quality === 'standard' ? 'standard' : 'highest',
         concurrency: Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(1, Math.round(Number(body.concurrency) || DOWNLOAD_CONCURRENCY))),
         skipExisting: body.skipExisting !== false, cancelRequested: false, error: null, items
       };

@@ -101,7 +101,8 @@ function render() {
   $('#like-count').textContent = state.like.length;
   $('#collect-count').textContent = state.collect.length;
   $('#user-count').textContent = state.user.length;
-  const workCount = state.like.length;
+  const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
+  const workCount = sourceItems.length;
   $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(downloadJob?.status);
   $('#download-all').textContent = workCount ? `下载全部作品（${workCount}）` : '下载全部作品';
   const grid = $('#grid');
@@ -137,7 +138,8 @@ function formatSpeed(value) {
 function renderDownloadJob(job) {
   // 根据后台任务快照刷新总进度、并发状态和当前下载明细。
   downloadJob = job;
-  $('#download-all').disabled = state.like.length === 0 || ['running', 'pending'].includes(job?.status);
+  const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
+  $('#download-all').disabled = sourceItems.length === 0 || ['running', 'pending'].includes(job?.status);
   const panel = $('#download-status');
   panel.hidden = !job || isDismissedDownloadJob(job);
   if (!job) return;
@@ -180,15 +182,16 @@ async function pollDownloadJob(id) {
 }
 
 async function createDownloadJob() {
-  // 使用当前页面的全部喜欢作品创建批量下载任务。
-  const works = state.like;
+  // 使用当前标签的全部作品创建批量下载任务。
+  const source = ['like', 'collect', 'user'].includes(state.source) ? state.source : 'like';
+  const works = Array.isArray(state[source]) ? state[source] : [];
   if (!works.length) return;
   const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
-  const confirmed = await requestDownloadConfirmation(works.length, quality, concurrency);
+  const confirmed = await requestDownloadConfirmation(source, quality, concurrency);
   if (!confirmed) return;
   clearDismissedDownloadJob();
-  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quality, concurrency, skipExisting: true }) });
+  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, quality, concurrency, skipExisting: true }) });
   const job = await response.json();
   if (!response.ok) throw new Error(job.error || '创建下载任务失败');
   renderDownloadJob(job);
@@ -196,11 +199,14 @@ async function createDownloadJob() {
   pollDownloadJob(job.id);
 }
 
-function requestDownloadConfirmation(count, quality, concurrency) {
+function requestDownloadConfirmation(source, quality, concurrency) {
   // 打开自定义确认弹窗，并等待用户明确选择开始或取消。
   const modal = $('#download-confirm-modal');
-  const videoCount = state.like.filter(item => item.mediaType !== 'image').length;
-  const imageCount = state.like.filter(item => item.mediaType === 'image').length;
+  const works = Array.isArray(state[source]) ? state[source] : [];
+  const videoCount = works.filter(item => item.mediaType !== 'image').length;
+  const imageCount = works.filter(item => item.mediaType === 'image').length;
+  const sourceLabel = source === 'user' ? '用户作品' : source === 'collect' ? '收藏作品' : '喜欢的作品';
+  $('#download-confirm-title').textContent = `准备下载${sourceLabel}`;
   $('#download-confirm-video-count').textContent = videoCount;
   $('#download-confirm-image-count').textContent = imageCount;
   $('#download-confirm-quality').textContent = quality === 'standard' ? '标准' : '最高';
