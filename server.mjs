@@ -645,6 +645,10 @@ async function loadDownloadJobs() {
     const data = JSON.parse(await fs.readFile(downloadStatePath, 'utf8'));
     for (const job of data.jobs || []) {
       if (!job?.id || !Array.isArray(job.items)) continue;
+      // 旧版本任务没有 fileBaseName，恢复时固定使用旧的 ID 文件名，避免断点文件路径改变。
+      for (const item of job.items) {
+        if (!item.fileBaseName) item.fileBaseName = `douyin-${String(item.id).replace(/[^0-9]/g, '') || 'media'}`;
+      }
       for (const item of job.items) if (item.status === 'downloading') item.status = 'pending';
       if (job.status === 'running' || job.status === 'downloading') job.status = 'paused';
       job.runningPromise = null;
@@ -735,8 +739,21 @@ function updateDownloadJob(job) {
   queueDownloadStateSave();
 }
 
-function safeFileName(id) {
-  return `douyin-${String(id).replace(/[^0-9]/g, '') || 'media'}.mp4`;
+function safeDownloadTitle(title, id) {
+  const fallback = `douyin-${String(id).replace(/[^0-9]/g, '') || 'media'}`;
+  let value = String(title || '')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '')
+    .slice(0, 120)
+    .replace(/[. ]+$/g, '');
+  if (!value || /^\.+$/.test(value) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) return fallback;
+  return value;
+}
+
+function safeFileName(item) {
+  return `${item.fileBaseName || safeDownloadTitle(item.title, item.id)}.mp4`;
 }
 
 function updateDownloadRate(item, bytesAdded) {
@@ -777,7 +794,7 @@ async function downloadJobItem(job, item) {
   if (item.mediaType === 'image') return downloadImageAlbumItem(job, item);
   // 立即占用队列项，再执行磁盘检查，避免多个 worker 同时领取同一作品。
   item.status = 'downloading';
-  const target = path.join(downloadRoot, safeFileName(item.id));
+  const target = path.join(downloadRoot, safeFileName(item));
   const partial = `${target}.part`;
   item.path = target;
   if (job.skipExisting) {
@@ -897,9 +914,7 @@ async function downloadImageAlbumItem(job, item) {
         if (stopIfInactive()) return;
         const url = images[index];
         registerMediaUrls({ playUrls: [], images: [url] });
-        const imageName = useAlbumFolder
-          ? `${String(index + 1).padStart(3, '0')}.jpg`
-          : `${safeAlbumDirectory(item.id)}-${String(index + 1).padStart(3, '0')}.jpg`;
+        const imageName = `${item.fileBaseName || safeDownloadTitle(item.title, item.id)}-${index + 1}.jpg`;
         const target = path.join(folder, imageName);
         const partial = `${target}.part`;
         try {
@@ -1499,14 +1514,20 @@ const server = http.createServer(async (req, res) => {
       const source = ['like', 'collect', 'user'].includes(body.source) ? body.source : 'like';
       const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户' };
       const sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
+      const titleCounts = new Map();
       const items = sourceItems.filter(item => /^\d+$/.test(String(item.id)))
-        .map(item => ({
-          id: String(item.id), title: item.title || '', author: item.author || '',
-          mediaType: item.mediaType === 'image' ? 'image' : 'video',
-          playUrl: isDouyinMediaUrl(item.playUrl) ? item.playUrl : '',
-          images: Array.isArray(item.images) ? item.images.filter(isDouyinMediaUrl) : [],
-          status: 'pending', bytes: 0, totalBytes: 0, attempts: 0, error: null, path: ''
-        }));
+        .map(item => {
+          const fileBaseName = safeDownloadTitle(item.title, item.id);
+          const occurrence = (titleCounts.get(fileBaseName) || 0) + 1;
+          titleCounts.set(fileBaseName, occurrence);
+          return {
+            id: String(item.id), title: item.title || '', author: item.author || '', fileBaseName: occurrence > 1 ? `${fileBaseName}-${occurrence}` : fileBaseName,
+            mediaType: item.mediaType === 'image' ? 'image' : 'video',
+            playUrl: isDouyinMediaUrl(item.playUrl) ? item.playUrl : '',
+            images: Array.isArray(item.images) ? item.images.filter(isDouyinMediaUrl) : [],
+            status: 'pending', bytes: 0, totalBytes: 0, attempts: 0, error: null, path: ''
+          };
+        });
       if (!items.length) return send(res, 400, JSON.stringify({ error: `没有可下载的${sourceLabels[source]}作品，请先完成同步` }));
       const job = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
