@@ -147,6 +147,7 @@ function renderDownloadJob(job) {
   const progress = job.total ? Math.round(finished * 100 / job.total) : 0;
   if (job.concurrency) $('#download-concurrency').value = String(Math.min(10, Math.max(1, job.concurrency)));
   if (job.quality) $('#download-quality').value = job.quality === 'standard' ? 'standard' : 'highest';
+  $('#download-album-mode').value = job.albumMode === 'flat' ? 'flat' : 'folder';
   const label = job.status === 'completed' ? '批量下载完成' : job.status === 'completed_with_errors' ? '批量下载完成（有失败项）' : job.status === 'failed' ? '批量下载失败' : job.status === 'cancelled' ? '批量下载已取消' : '批量下载';
   $('#download-title').textContent = label;
   const activeConcurrency = Number(job.activeConcurrency || 0);
@@ -162,6 +163,7 @@ function renderDownloadJob(job) {
   const running = job.status === 'running';
   $('#download-quality').disabled = running || job.status === 'pending';
   $('#download-concurrency').disabled = running || job.status === 'pending';
+  $('#download-album-mode').disabled = running || job.status === 'pending';
   $('#download-pause').hidden = !running;
   $('#download-resume').hidden = !['paused', 'failed', 'completed_with_errors'].includes(job.status);
   $('#download-retry').hidden = job.failed === 0;
@@ -188,10 +190,11 @@ async function createDownloadJob() {
   if (!works.length) return;
   const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
-  const confirmed = await requestDownloadConfirmation(source, quality, concurrency);
+  const albumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
+  const confirmed = await requestDownloadConfirmation(source, quality, concurrency, albumMode);
   if (!confirmed) return;
   clearDismissedDownloadJob();
-  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, quality, concurrency, skipExisting: true }) });
+  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, quality, concurrency, albumMode, skipExisting: true }) });
   const job = await response.json();
   if (!response.ok) throw new Error(job.error || '创建下载任务失败');
   renderDownloadJob(job);
@@ -199,7 +202,7 @@ async function createDownloadJob() {
   pollDownloadJob(job.id);
 }
 
-function requestDownloadConfirmation(source, quality, concurrency) {
+function requestDownloadConfirmation(source, quality, concurrency, albumMode) {
   // 打开自定义确认弹窗，并等待用户明确选择开始或取消。
   const modal = $('#download-confirm-modal');
   const works = Array.isArray(state[source]) ? state[source] : [];
@@ -211,7 +214,9 @@ function requestDownloadConfirmation(source, quality, concurrency) {
   $('#download-confirm-image-count').textContent = imageCount;
   $('#download-confirm-quality').textContent = quality === 'standard' ? '标准' : '最高';
   $('#download-confirm-concurrency').textContent = concurrency;
-  $('#download-confirm-directory').textContent = '保存位置：项目目录 / downloads';
+  $('#download-confirm-directory').textContent = albumMode === 'flat'
+    ? '保存位置：项目目录 / downloads（图集图片与视频同目录）'
+    : '保存位置：项目目录 / downloads（图集图片使用独立文件夹）';
   if (!modal.open) modal.showModal();
   return new Promise(resolve => { downloadConfirmResolver = resolve; });
 }

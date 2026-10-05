@@ -60,6 +60,17 @@
               </option>
             </select>
           </label>
+          <label class="concurrency-control" for="download-album-mode">
+            图集保存
+            <select id="download-album-mode" aria-label="图集保存方式">
+              <option value="folder" selected>
+                独立文件夹
+              </option>
+              <option value="flat">
+                与视频同目录
+              </option>
+            </select>
+          </label>
           <button id="download-all" class="secondary" disabled>
             下载全部作品
           </button>
@@ -188,7 +199,7 @@
           准备下载喜欢的作品
         </h2>
         <p class="download-confirm-description">
-          视频保存为 MP4，图集会建立独立文件夹保存全部图片。任务会在后台运行，页面关闭后也不会中断。
+          视频保存为 MP4，图集保存方式由顶部选项决定。任务会在后台运行，页面关闭后也不会中断。
         </p>
         <div class="download-confirm-summary">
           <div>

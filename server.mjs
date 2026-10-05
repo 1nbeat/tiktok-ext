@@ -618,6 +618,7 @@ function publicDownloadJob(job) {
     updatedAt: job.updatedAt,
     source: job.source,
     quality: job.quality,
+    albumMode: job.albumMode === 'flat' ? 'flat' : 'folder',
     concurrency: Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(1, Number(job.concurrency) || DOWNLOAD_CONCURRENCY)),
     activeConcurrency: job.status === 'running' ? job.items.filter(item => item.status === 'downloading').length : 0,
     videoCount: job.items.filter(item => item.mediaType !== 'image').length,
@@ -865,7 +866,7 @@ async function downloadJobItem(job, item) {
 }
 
 async function downloadImageAlbumItem(job, item) {
-  // 按顺序下载图集中的每张图片，并保存到作品专属文件夹。
+  // 按顺序下载图集中的每张图片；目录规则由创建任务时的 albumMode 固定。
   const runToken = job.runToken;
   const inactive = () => job.status !== 'running' || job.cancelRequested || job.runToken !== runToken;
   const stopIfInactive = () => {
@@ -875,7 +876,8 @@ async function downloadImageAlbumItem(job, item) {
     return true;
   };
   const root = downloadRoot;
-  const folder = path.join(root, safeAlbumDirectory(item.id));
+  const useAlbumFolder = job.albumMode !== 'flat';
+  const folder = useAlbumFolder ? path.join(root, safeAlbumDirectory(item.id)) : root;
   item.path = folder;
   item.status = 'downloading';
   item.speedBps = 0;
@@ -895,7 +897,10 @@ async function downloadImageAlbumItem(job, item) {
         if (stopIfInactive()) return;
         const url = images[index];
         registerMediaUrls({ playUrls: [], images: [url] });
-        const target = path.join(folder, `${String(index + 1).padStart(3, '0')}.jpg`);
+        const imageName = useAlbumFolder
+          ? `${String(index + 1).padStart(3, '0')}.jpg`
+          : `${safeAlbumDirectory(item.id)}-${String(index + 1).padStart(3, '0')}.jpg`;
+        const target = path.join(folder, imageName);
         const partial = `${target}.part`;
         try {
           const stat = await fs.stat(target);
@@ -1507,6 +1512,7 @@ const server = http.createServer(async (req, res) => {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         source, quality: body.quality === 'standard' ? 'standard' : 'highest',
+        albumMode: body.albumMode === 'flat' ? 'flat' : 'folder',
         concurrency: Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(1, Math.round(Number(body.concurrency) || DOWNLOAD_CONCURRENCY))),
         skipExisting: body.skipExisting !== false, cancelRequested: false, error: null, items
       };
