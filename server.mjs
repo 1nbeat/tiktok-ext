@@ -340,6 +340,70 @@ const pageScript = `(async () => {
   return result;
 })()`;
 
+// 在已经打开的抖音用户主页中滚动作品列表。作品数据由 CDP Network 事件读取，
+// 这里主要负责触发虚拟列表加载，并通过控制台事件报告进度。
+const userPageScript = `(async () => {
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const click = text => {
+    const el = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && e.textContent.trim() === text);
+    if (el) { el.click(); return true; }
+    return false;
+  };
+  // 首先主动请求用户作品分页，确保首屏已经加载完成时仍能捕获作品数据。
+  const loadApiPages = async () => {
+    const secUserId = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
+    if (!secUserId) return;
+    let cursor = 0;
+    const seen = new Set(['0']);
+    for (let page = 0; page < 220; page += 1) {
+      const query = new URLSearchParams({
+        device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
+        sec_user_id: secUserId, count: '18', max_cursor: String(cursor),
+        locate_query: 'false', publish_time: '0', show_live_replay_strategy: '1'
+      });
+      const response = await fetch('/aweme/v1/web/aweme/post/?' + query.toString(), { credentials: 'include', cache: 'no-store' });
+      if (!response.ok) throw new Error('用户作品接口请求失败（' + response.status + '）');
+      const data = await response.json();
+      if (!Array.isArray(data?.aweme_list)) throw new Error('用户作品接口返回格式异常');
+      console.log('__DY_PROFILE_PROGRESS__', page + 1, 220, data.aweme_list.length);
+      if (!data.has_more) return;
+      const next = Number(data.max_cursor);
+      if (!Number.isFinite(next) || seen.has(String(next))) throw new Error('用户作品接口游标异常');
+      seen.add(String(next));
+      cursor = next;
+      await sleep(50);
+    }
+  };
+  const findScrollable = () => [...document.querySelectorAll('*')]
+    .filter(el => el.scrollHeight - el.clientHeight > 300)
+    .sort((a, b) => b.scrollHeight - a.scrollHeight);
+  click('作品');
+  await sleep(700);
+  let apiLoaded = false;
+  try { await loadApiPages(); apiLoaded = true; } catch (error) { console.warn('用户作品接口分页失败：' + error.message); }
+  if (apiLoaded) return { ok: true, mode: 'api' };
+  let stableRounds = 0;
+  let previousHeight = 0;
+  for (let page = 0; page < 240; page += 1) {
+    const scrollers = findScrollable();
+    const beforeHeight = Math.max(document.body.scrollHeight, ...scrollers.map(el => el.scrollHeight), 0);
+    for (const scroller of scrollers) {
+      scroller.scrollTop = scroller.scrollHeight;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+    window.scrollTo(0, document.body.scrollHeight);
+    await sleep(260);
+    const afterHeight = Math.max(document.body.scrollHeight, ...findScrollable().map(el => el.scrollHeight), 0);
+    const count = document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]').length;
+    console.log('__DY_PROFILE_PROGRESS__', page + 1, 240, count);
+    if (afterHeight <= beforeHeight + 20 && afterHeight <= previousHeight + 20) stableRounds += 1;
+    else stableRounds = 0;
+    previousHeight = afterHeight;
+    if (stableRounds >= 6) break;
+  }
+  return { ok: true };
+})()`;
+
 function itemFromAweme(item, source) {
   // 将抖音接口的原始 aweme 结构压缩成前端展示所需的统一字段。
   // 同一图片的 url_list 是不同 CDN 线路，不是多张图片；每个图片对象只选一个地址。
@@ -1259,9 +1323,116 @@ async function syncFromChrome(onProgress = () => {}) {
   } finally { ws.close(); }
 }
 
+// 抓取已经打开的指定用户主页。抖音用户主页的作品列表接口会随版本变化，
+// 因此这里监听所有可能的用户作品接口，只接收其中包含 aweme_list 的响应。
+async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
+  const target = new URL(profileUrl);
+  const isDouyinHost = hostname => hostname === 'douyin.com' || hostname.endsWith('.douyin.com');
+  if (!/^\/user\//.test(target.pathname) || !isDouyinHost(target.hostname)) throw new Error('请输入抖音用户主页链接');
+  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const targetPath = target.pathname.replace(/\/+$/, '');
+  let tab = tabs.find(candidate => {
+    if (candidate.type !== 'page' || !candidate.url) return false;
+    try {
+      const current = new URL(candidate.url);
+      return isDouyinHost(current.hostname) && current.pathname.replace(/\/+$/, '') === targetPath;
+    } catch { return false; }
+  });
+  if (!tab) {
+    // 输入链接可能在普通 Chrome 窗口中打开，无法出现在 9222 的标签列表里。
+    // 此时复用当前调试 Chrome 的登录环境自动创建一个目标页，避免用户必须手动切换窗口。
+    const version = await (await fetch('http://127.0.0.1:9222/json/version')).json();
+    const browser = await connectCdp(version.webSocketDebuggerUrl);
+    let targetId;
+    try {
+      ({ targetId } = await cdpCall(browser, 'Target.createTarget', { url: target.href, background: false }));
+    } finally {
+      try { browser.close(); } catch { /* 忽略浏览器连接关闭异常 */ }
+    }
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const currentTabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+      tab = currentTabs.find(candidate => candidate.type === 'page' && candidate.id === targetId);
+      if (tab) break;
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+  }
+  if (!tab) throw new Error('无法在调试 Chrome 中打开该用户主页，请确认 9222 端口可用。');
+  const ws = await connectCdp(tab.webSocketDebuggerUrl);
+  try {
+    ws.responseUrls = new Map();
+    ws.responseBodies = new Map();
+    ws.responseBodyPromises = [];
+    ws.onEvent = event => {
+      if (event.method === 'Runtime.consoleAPICalled') {
+        const values = event.params.args.map(arg => arg.value);
+        if (values[0] === '__DY_PROFILE_PROGRESS__') {
+          const current = Number(values[1]) || 0;
+          const total = Number(values[2]) || 240;
+          const count = Number(values[3]) || 0;
+          onProgress({ progress: Math.min(99, Math.round(current * 100 / total)), pages: current, count, message: `正在加载用户作品（已发现 ${count} 条）` });
+        }
+      }
+      if (event.method === 'Network.responseReceived' && /\/aweme\/v1\/web\//i.test(event.params.response.url)) {
+        ws.responseUrls.set(event.params.requestId, event.params.response.url);
+      }
+      if (event.method === 'Network.loadingFinished' && ws.responseUrls.has(event.params.requestId)) {
+        const requestId = event.params.requestId;
+        const bodyPromise = cdpCall(ws, 'Network.getResponseBody', { requestId }).then(body => {
+          try {
+            const data = JSON.parse(body.body);
+            if (Array.isArray(data?.aweme_list)) ws.responseBodies.set(requestId, { url: ws.responseUrls.get(requestId), data });
+          } catch { /* 忽略已经被 Chrome 回收或不是 JSON 的响应 */ }
+        }).catch(() => {});
+        ws.responseBodyPromises.push(bodyPromise);
+      }
+    };
+    await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 100 * 1024 * 1024, maxResourceBufferSize: 5 * 1024 * 1024 });
+    await cdpCall(ws, 'Runtime.enable');
+    // 新建标签页仍处于导航阶段时，Runtime.evaluate 可能因为执行上下文被替换而失败。
+    // 等待短暂稳定并重试，避免用户第一次加载必须手动再点一次。
+    let evaluation = null;
+    let lastEvaluationError = null;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        evaluation = await cdpCall(ws, 'Runtime.evaluate', { expression: userPageScript, returnByValue: true, awaitPromise: true });
+        const exceptionText = evaluation?.exceptionDetails?.exception?.description
+          || evaluation?.exceptionDetails?.text
+          || '';
+        if (!evaluation?.exceptionDetails) break;
+        lastEvaluationError = new Error(exceptionText || '用户主页脚本执行失败');
+        if (!/execution context was destroyed|cannot find context|context.*destroyed/i.test(exceptionText)) throw lastEvaluationError;
+      } catch (error) {
+        lastEvaluationError = error;
+        if (!/execution context was destroyed|cannot find context|context.*destroyed/i.test(String(error?.message || error))) throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+    if (!evaluation || evaluation.exceptionDetails) throw lastEvaluationError || new Error('用户主页脚本执行失败');
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const pending = ws.responseBodyPromises.slice();
+      await Promise.allSettled(pending);
+      if (pending.length === ws.responseBodyPromises.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (pending.length === ws.responseBodyPromises.length) break;
+      }
+    }
+    const items = new Map();
+    for (const { data } of ws.responseBodies.values()) {
+      for (const item of data.aweme_list || []) {
+        const normalized = itemFromAweme(item, 'user');
+        if (/^\d+$/.test(normalized.id) && !items.has(normalized.id)) items.set(normalized.id, normalized);
+      }
+    }
+    if (!items.size) throw new Error('没有从该用户主页获取到作品，请确认页面已加载完成且账号可以访问作品列表。');
+    onProgress({ progress: 100, pages: 0, count: items.size, message: `用户作品加载完成：${items.size} 条` });
+    return { items: [...items.values()], profileUrl: target.href, syncedAt: new Date().toISOString() };
+  } finally { ws.close(); }
+}
+
 // 最新一次成功同步的数据只保存在内存中，重启服务后会清空。
-let latestData = { like: [], collect: [], syncedAt: null };
+let latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
 let syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
+let userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
 
 // 后台启动同步，避免 HTTP 请求一直等待页面滚动完成。
 function startSync() {
@@ -1275,10 +1446,24 @@ function startSync() {
     }
     if (update.phase) Object.assign(syncState, update);
   }).then(data => {
-    latestData = data;
+    latestData = { ...data, user: latestData.user, userProfileUrl: latestData.userProfileUrl };
     syncState = { ...syncState, running: false, progress: 100, phase: 'done', message: '同步完成' };
   }).catch(error => {
     syncState = { ...syncState, running: false, message: '同步失败', error: error.message };
+  });
+}
+
+function startUserSync(profileUrl) {
+  if (userSyncState.running) return;
+  userSyncState = { running: true, progress: 0, pages: 0, count: 0, message: '正在连接用户主页', profileUrl, error: null };
+  syncUserFromChrome(profileUrl, update => {
+    userSyncState = { ...userSyncState, ...update };
+  }).then(data => {
+    latestData.user = data.items;
+    latestData.userProfileUrl = data.profileUrl;
+    userSyncState = { ...userSyncState, running: false, progress: 100, count: data.items.length, message: `用户作品加载完成：${data.items.length} 条` };
+  }).catch(error => {
+    userSyncState = { ...userSyncState, running: false, message: '用户作品加载失败', error: error.message };
   });
 }
 
@@ -1289,6 +1474,18 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/api/sync/start' && req.method === 'POST') {
       startSync();
       return send(res, 202, JSON.stringify(syncState));
+    }
+    if (requestUrl.pathname === '/api/profile/sync' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      let profileUrl;
+      try { profileUrl = new URL(String(body.url || '')).href; } catch { return send(res, 400, JSON.stringify({ error: '请输入有效的用户主页链接' })); }
+      const parsedProfileUrl = new URL(profileUrl);
+      if (!/^\/user\//.test(parsedProfileUrl.pathname) || !(parsedProfileUrl.hostname === 'douyin.com' || parsedProfileUrl.hostname.endsWith('.douyin.com'))) return send(res, 400, JSON.stringify({ error: '链接必须是抖音用户主页地址' }));
+      startUserSync(profileUrl);
+      return send(res, 202, JSON.stringify(userSyncState));
+    }
+    if (requestUrl.pathname === '/api/profile/sync/status' && req.method === 'GET') {
+      return send(res, 200, JSON.stringify({ ...userSyncState, data: userSyncState.running ? null : latestData.user, userProfileUrl: latestData.userProfileUrl }));
     }
     if (req.url === '/api/sync/status') return send(res, 200, JSON.stringify({ ...syncState, data: syncState.phase === 'done' ? latestData : null }));
     if (req.url === '/api/sync') return send(res, 200, JSON.stringify(latestData));
@@ -1364,7 +1561,7 @@ const server = http.createServer(async (req, res) => {
       const id = requestUrl.searchParams.get('id') || '';
       if (!/^\d+$/.test(id)) return send(res, 400, JSON.stringify({ error: '缺少有效的作品 ID' }));
       // 同步结果存在时沿用列表中的来源信息；即使服务刚重启，也允许按 ID 实时读取详情。
-      const base = [...latestData.like, ...latestData.collect].find(item => item.id === id) || { id, source: 'like' };
+      const base = [...latestData.like, ...latestData.collect, ...latestData.user].find(item => item.id === id) || { id, source: 'like' };
       // 视频同步结果通常已有播放地址，但性别、地区等作者资料需要详情接口补充。
       const hasVideoMedia = base.mediaType !== 'image'
         && isDouyinMediaUrl(base.playUrl)

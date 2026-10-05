@@ -1,7 +1,7 @@
 // 每页展示固定数量，避免内容过多时一次性渲染造成卡顿。
 const PAGE_SIZE = 24;
 // saved 表示保持抖音原页面顺序，其余选项是用户主动选择的排序方式。
-const state = { source: 'like', like: [], collect: [], query: '', sort: 'saved', page: 1 };
+const state = { source: 'like', like: [], collect: [], user: [], query: '', sort: 'saved', page: 1 };
 const $ = selector => document.querySelector(selector);
 let modalRequestId = 0;
 let downloadJob = null;
@@ -100,6 +100,7 @@ function render() {
   state.page = Math.min(state.page, totalPages);
   $('#like-count').textContent = state.like.length;
   $('#collect-count').textContent = state.collect.length;
+  $('#user-count').textContent = state.user.length;
   const workCount = state.like.length;
   $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(downloadJob?.status);
   $('#download-all').textContent = workCount ? `下载全部作品（${workCount}）` : '下载全部作品';
@@ -674,6 +675,25 @@ async function pollSync() {
   }
 }
 
+async function pollUserSync() {
+  const response = await fetch('/api/profile/sync/status');
+  const sync = await response.json();
+  $('#status').textContent = sync.error || sync.message;
+  $('#progress-value').style.width = `${sync.progress || 0}%`;
+  $('#progress-detail').textContent = sync.running ? `${sync.progress || 0}% · 已发现 ${sync.count || 0} 条作品` : '';
+  $('#sync-status-close').hidden = sync.running;
+  if (sync.running) return setTimeout(pollUserSync, 500);
+  $('#profile-sync-start').disabled = false;
+  if (sync.error) { $('#status').classList.add('error'); return; }
+  if (Array.isArray(sync.data)) {
+    state.user = sync.data;
+    state.source = 'user';
+    document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.source === 'user'));
+    resetPageAndRender();
+    $('#status').textContent = `用户作品加载完成：${state.user.length} 条`;
+  }
+}
+
 // 卡片点击和键盘确认都进入同一个本地弹窗流程。
 $('#grid').addEventListener('click', event => {
   const card = event.target.closest('.card');
@@ -830,6 +850,48 @@ $('#sync').addEventListener('click', async () => {
     button.disabled = false;
   }
 });
+
+$('#profile-sync').addEventListener('click', () => {
+  const modal = $('#profile-sync-modal');
+  $('#profile-sync-url').value = '';
+  $('#profile-sync-error').textContent = '';
+  if (!modal.open) modal.showModal();
+  setTimeout(() => $('#profile-sync-url').focus(), 0);
+});
+$('#profile-sync-close').addEventListener('click', () => $('#profile-sync-modal').close());
+$('#profile-sync-cancel').addEventListener('click', () => $('#profile-sync-modal').close());
+$('#profile-sync-modal').addEventListener('click', event => {
+  if (event.target === event.currentTarget) event.currentTarget.close();
+});
+$('#profile-sync-start').addEventListener('click', async () => {
+  const input = $('#profile-sync-url');
+  const button = $('#profile-sync-start');
+  const value = input.value.trim();
+  let url;
+  try { url = new URL(value); } catch { $('#profile-sync-error').textContent = '请输入有效的用户主页链接'; input.focus(); return; }
+  if (!/^\/user\//.test(url.pathname)) { $('#profile-sync-error').textContent = '链接必须是抖音用户主页地址'; input.focus(); return; }
+  button.disabled = true;
+  $('#profile-sync-error').textContent = '';
+  $('#profile-sync-modal').close();
+  $('#sync-status').hidden = false;
+  $('#progress-track').hidden = false;
+  $('#progress-value').style.width = '0%';
+  $('#sync-status-close').hidden = true;
+  $('#status').classList.remove('error');
+  try {
+    const response = await fetch('/api/profile/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: url.href }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '启动用户作品加载失败');
+    pollUserSync();
+  } catch (error) {
+    $('#status').textContent = error.message;
+    $('#status').classList.add('error');
+    button.disabled = false;
+  }
+});
+$('#profile-sync-url').addEventListener('keydown', event => {
+  if (event.key === 'Enter') $('#profile-sync-start').click();
+});
 $('#sync-status-close').addEventListener('click', () => { $('#sync-status').hidden = true; });
 $('#download-status-close').addEventListener('click', () => {
   rememberDismissedDownloadJob(downloadJob);
@@ -842,8 +904,19 @@ async function restoreLatest() {
     if (sync.data) {
       state.like = sync.data.like || [];
       state.collect = sync.data.collect || [];
+      state.user = sync.data.user || [];
       $('#status').textContent = `最近同步：喜欢 ${state.like.length} 条，收藏 ${state.collect.length} 条（${new Date(sync.data.syncedAt).toLocaleString()}）`;
       render();
+    }
+    const profileSync = await (await fetch('/api/profile/sync/status')).json();
+    if (Array.isArray(profileSync.data) && profileSync.data.length) {
+      state.user = profileSync.data;
+      render();
+    }
+    if (profileSync.running) {
+      $('#sync-status').hidden = false;
+      $('#progress-track').hidden = false;
+      pollUserSync();
     }
     const jobs = await (await fetch('/api/download/jobs')).json();
     const active = jobs.find(job => ['running', 'pending', 'paused', 'failed', 'completed_with_errors'].includes(job.status) && !isDismissedDownloadJob(job));

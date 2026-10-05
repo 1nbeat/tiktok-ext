@@ -66,6 +66,9 @@
           <button id="download-specified" class="secondary" type="button">
             下载指定
           </button>
+          <button id="profile-sync" class="secondary" type="button">
+            用户主页
+          </button>
           <button id="sync" class="primary">
             从抖音同步
           </button>
@@ -135,6 +138,10 @@
           <span id="collect-count">
             0
           </span>
+        </button>
+        <button class="tab" data-source="user">
+          用户作品
+          <span id="user-count">0</span>
         </button>
       </nav>
       <!-- 搜索和排序作用于当前标签；“列表顺序”保持抖音页面顺序。 -->
@@ -226,6 +233,23 @@
           <button id="download-confirm-start" class="primary" type="button">
             开始下载
           </button>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="profile-sync-modal" class="download-confirm-modal specified-download-modal" aria-labelledby="profile-sync-title">
+      <button id="profile-sync-close" class="modal-close" type="button" aria-label="关闭用户主页窗口">×</button>
+      <div class="download-confirm-content">
+        <p class="modal-label">用户主页</p>
+        <h2 id="profile-sync-title">加载指定用户作品</h2>
+        <p class="download-confirm-description">请输入已经在 Chrome 中打开的抖音用户主页链接，程序会滚动加载该用户的作品。</p>
+        <label class="specified-download-field" for="profile-sync-url">
+          <span>用户主页链接</span>
+          <input id="profile-sync-url" type="url" autocomplete="off" placeholder="https://www.douyin.com/user/..." />
+        </label>
+        <p id="profile-sync-error" class="specified-download-error" role="alert"></p>
+        <div class="download-confirm-actions">
+          <button id="profile-sync-cancel" type="button">取消</button>
+          <button id="profile-sync-start" class="primary" type="button">开始加载</button>
         </div>
       </div>
     </dialog>
