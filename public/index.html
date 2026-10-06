@@ -13,76 +13,23 @@
     <main class="shell">
       <!-- 顶部操作区：同步在 Chrome 中的抖音页面，结果显示在下方。 -->
       <header class="topbar">
+        <div class="topbar-heading">
+          <p class="eyebrow">DOUYIN EXT</p>
+          <h1>作品库</h1>
+          <p class="topbar-caption">同步、筛选和管理你的抖音作品</p>
+        </div>
         <div class="topbar-actions">
-          <label class="concurrency-control" for="download-quality">
-            清晰度
-            <select id="download-quality" aria-label="下载清晰度">
-              <option value="highest" selected>
-                最高
-              </option>
-              <option value="standard">
-                标准
-              </option>
-            </select>
-          </label>
-          <label class="concurrency-control" for="download-concurrency">
-            并发
-            <select id="download-concurrency" aria-label="下载并发数">
-              <option value="1">
-                1
-              </option>
-              <option value="2" selected>
-                2
-              </option>
-              <option value="3">
-                3
-              </option>
-              <option value="4">
-                4
-              </option>
-              <option value="5">
-                5
-              </option>
-              <option value="6">
-                6
-              </option>
-              <option value="7">
-                7
-              </option>
-              <option value="8">
-                8
-              </option>
-              <option value="9">
-                9
-              </option>
-              <option value="10">
-                10
-              </option>
-            </select>
-          </label>
-          <label class="concurrency-control" for="download-album-mode">
-            图集保存
-            <select id="download-album-mode" aria-label="图集保存方式">
-              <option value="folder" selected>
-                独立文件夹
-              </option>
-              <option value="flat">
-                与视频同目录
-              </option>
-            </select>
-          </label>
-          <button id="download-all" class="secondary" disabled>
-            下载全部作品
-          </button>
-          <button id="download-specified" class="secondary" type="button">
-            下载指定
-          </button>
-          <button id="profile-sync" class="secondary" type="button">
-            用户主页
-          </button>
-          <button id="sync" class="primary">
-            从抖音同步
-          </button>
+          <div class="topbar-buttons">
+            <div class="topbar-data-actions">
+              <button id="profile-sync" class="secondary" type="button">加载用户作品</button>
+              <button id="sync" class="primary">同步喜欢与收藏</button>
+            </div>
+            <span class="topbar-divider" aria-hidden="true"></span>
+            <div class="topbar-download-actions">
+              <button id="download-specified" class="secondary" type="button">下载作品链接</button>
+              <button id="download-all" class="secondary" disabled>批量下载当前列表</button>
+            </div>
+          </div>
         </div>
       </header>
       <!-- 同步开始后才展示状态和动态进度，避免首页默认占用一块空白区域。 -->
@@ -199,8 +146,39 @@
           准备下载喜欢的作品
         </h2>
         <p class="download-confirm-description">
-          视频保存为 MP4，图集保存方式由顶部选项决定。任务会在后台运行，页面关闭后也不会中断。
+          视频保存为 MP4，图集可以按作品分文件夹或与视频放在同一目录。任务会在后台运行，页面关闭后也不会中断。
         </p>
+        <div class="download-modal-settings" aria-label="批量下载设置">
+          <label class="download-option" for="download-quality">
+            <span>视频画质</span>
+            <select id="download-quality" aria-label="视频下载画质">
+              <option value="highest" selected>最高画质</option>
+              <option value="standard">标准画质</option>
+            </select>
+          </label>
+          <label class="download-option" for="download-concurrency">
+            <span>同时下载</span>
+            <select id="download-concurrency" aria-label="同时下载数量">
+              <option value="1">1 个</option>
+              <option value="2" selected>2 个</option>
+              <option value="3">3 个</option>
+              <option value="4">4 个</option>
+              <option value="5">5 个</option>
+              <option value="6">6 个</option>
+              <option value="7">7 个</option>
+              <option value="8">8 个</option>
+              <option value="9">9 个</option>
+              <option value="10">10 个</option>
+            </select>
+          </label>
+          <label class="download-option" for="download-album-mode">
+            <span>图集目录</span>
+            <select id="download-album-mode" aria-label="图集保存目录">
+              <option value="folder" selected>按图集分文件夹</option>
+              <option value="flat">与视频同目录</option>
+            </select>
+          </label>
+        </div>
         <div class="download-confirm-summary">
           <div>
             <strong id="download-confirm-video-count">
@@ -220,18 +198,18 @@
           </div>
           <div>
             <strong id="download-confirm-quality">
-              最高
+              最高画质
             </strong>
             <span>
-              清晰度
+              视频画质
             </span>
           </div>
           <div>
             <strong id="download-confirm-concurrency">
-              2
+              2 个
             </strong>
             <span>
-              个并发
+              同时下载
             </span>
           </div>
         </div>

@@ -104,7 +104,7 @@ function render() {
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
   const workCount = sourceItems.length;
   $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(downloadJob?.status);
-  $('#download-all').textContent = workCount ? `下载全部作品（${workCount}）` : '下载全部作品';
+  $('#download-all').textContent = workCount ? `批量下载当前列表（${workCount}）` : '批量下载当前列表';
   const grid = $('#grid');
   if (!items.length) {
     grid.innerHTML = '<div class="empty">暂无已同步内容</div>';
@@ -188,11 +188,14 @@ async function createDownloadJob() {
   const source = ['like', 'collect', 'user'].includes(state.source) ? state.source : 'like';
   const works = Array.isArray(state[source]) ? state[source] : [];
   if (!works.length) return;
+  const initialQuality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
+  const initialConcurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
+  const initialAlbumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
+  const confirmed = await requestDownloadConfirmation(source, initialQuality, initialConcurrency, initialAlbumMode);
+  if (!confirmed) return;
   const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
   const albumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
-  const confirmed = await requestDownloadConfirmation(source, quality, concurrency, albumMode);
-  if (!confirmed) return;
   clearDismissedDownloadJob();
   const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, quality, concurrency, albumMode, skipExisting: true }) });
   const job = await response.json();
@@ -210,16 +213,33 @@ function requestDownloadConfirmation(source, quality, concurrency, albumMode) {
   const imageCount = works.filter(item => item.mediaType === 'image').length;
   const sourceLabel = source === 'user' ? '用户作品' : source === 'collect' ? '收藏作品' : '喜欢的作品';
   $('#download-confirm-title').textContent = `准备下载${sourceLabel}`;
+  $('#download-quality').value = quality;
+  $('#download-concurrency').value = String(concurrency);
+  $('#download-album-mode').value = albumMode;
+  $('#download-quality').disabled = false;
+  $('#download-concurrency').disabled = false;
+  $('#download-album-mode').disabled = false;
+  updateDownloadConfirmationOptions();
   $('#download-confirm-video-count').textContent = videoCount;
   $('#download-confirm-image-count').textContent = imageCount;
-  $('#download-confirm-quality').textContent = quality === 'standard' ? '标准' : '最高';
-  $('#download-confirm-concurrency').textContent = concurrency;
-  $('#download-confirm-directory').textContent = albumMode === 'flat'
-    ? '保存位置：项目目录 / downloads（图集图片与视频同目录）'
-    : '保存位置：项目目录 / downloads（图集图片使用独立文件夹）';
   if (!modal.open) modal.showModal();
   return new Promise(resolve => { downloadConfirmResolver = resolve; });
 }
+
+function updateDownloadConfirmationOptions() {
+  const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
+  const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
+  const albumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
+  $('#download-confirm-quality').textContent = quality === 'standard' ? '标准画质' : '最高画质';
+  $('#download-confirm-concurrency').textContent = `${concurrency} 个`;
+  $('#download-confirm-directory').textContent = albumMode === 'flat'
+    ? '保存位置：项目目录 / downloads（图集图片与视频同目录）'
+    : '保存位置：项目目录 / downloads（图集图片使用独立文件夹）';
+}
+
+['download-quality', 'download-concurrency', 'download-album-mode'].forEach(id => {
+  $(`#${id}`).addEventListener('change', updateDownloadConfirmationOptions);
+});
 
 function closeDownloadConfirmation(confirmed) {
   // 关闭确认弹窗，同时结算等待中的 Promise。

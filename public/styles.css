@@ -1394,3 +1394,327 @@ h1 {
   border-color:#fe2c55;
   color:#fe2c55
 }
+
+/* 顶部控制区：设置和动作分组，避免不同宽度下按钮互相挤压。 */
+.topbar {
+  display:grid;
+  grid-template-columns:minmax(220px,1fr) minmax(0,auto);
+  align-items:center;
+  gap:28px;
+  padding:4px 0 24px;
+  border-bottom:1px solid #dce1e6
+}
+.topbar-heading {
+  min-width:0
+}
+.topbar-heading .eyebrow {
+  margin:0 0 3px;
+  color:#fe2c55;
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:2px
+}
+.topbar-heading h1 {
+  margin:0;
+  color:#18202a;
+  font-size:27px;
+  line-height:1.2
+}
+.topbar-caption {
+  margin:7px 0 0;
+  color:#8b96a3;
+  font-size:12px
+}
+.topbar-actions {
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:14px;
+  min-width:0
+}
+.download-settings {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:5px;
+  border:1px solid #e1e5e9;
+  border-radius:9px;
+  background:#f8fafb
+}
+.concurrency-control {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  min-height:34px;
+  padding:0 7px;
+  color:#66727f;
+  font-size:12px;
+  white-space:nowrap
+}
+.concurrency-control select {
+  height:30px;
+  min-width:58px;
+  padding:0 22px 0 8px;
+  border:1px solid #d7dde3;
+  border-radius:6px;
+  background:#fff;
+  color:#18202a;
+  font:inherit
+}
+.topbar-buttons {
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap
+}
+.topbar-buttons button {
+  min-height:36px;
+  white-space:nowrap
+}
+.topbar-buttons .secondary {
+  padding:0 13px;
+  border-radius:7px;
+  font-size:13px
+}
+.topbar-buttons .primary {
+  min-width:104px;
+  padding:0 15px;
+  border-radius:7px;
+  font-size:13px
+}
+.topbar-buttons button:focus-visible,
+.download-settings select:focus-visible {
+  outline:3px solid #fe2c5533;
+  outline-offset:1px
+}
+
+@media(max-width:1050px) {
+  .topbar {
+    grid-template-columns:1fr;
+    align-items:stretch;
+    gap:16px
+  }
+  .topbar-actions {
+    justify-content:space-between;
+    flex-wrap:wrap
+  }
+  .topbar-buttons {
+    margin-left:auto
+  }
+}
+@media(max-width:700px) {
+  .topbar {
+    gap:14px;
+    padding-bottom:18px
+  }
+  .topbar-heading h1 {
+    font-size:23px
+  }
+  .topbar-caption {
+    margin-top:5px
+  }
+  .topbar-actions {
+    display:grid;
+    grid-template-columns:1fr;
+    gap:10px
+  }
+  .download-settings {
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:4px;
+    padding:4px
+  }
+  .concurrency-control {
+    display:grid;
+    gap:4px;
+    min-width:0;
+    padding:4px 5px;
+    font-size:11px
+  }
+  .concurrency-control select {
+    width:100%;
+    min-width:0
+  }
+  .topbar-buttons {
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:7px;
+    margin-left:0
+  }
+  .topbar-buttons button {
+    width:100%
+  }
+}
+
+/* 内容工具栏保持轻量分区，和顶部操作区形成清晰的视觉层级。 */
+.tabs {
+  gap:6px;
+  padding:4px;
+  border:1px solid #e1e5e9;
+  border-radius:9px;
+  background:#eef1f3
+}
+.tab {
+  min-height:36px;
+  padding:0 15px;
+  border-radius:6px;
+  font-size:13px
+}
+.tab.active {
+  background:#fff;
+  box-shadow:0 1px 4px #18202a12
+}
+.tab.active:after {
+  display:none
+}
+.tab.active span {
+  color:#fe2c55
+}
+.toolbar {
+  align-items:center;
+  gap:10px;
+  margin:18px 0 16px
+}
+.search {
+  min-height:38px;
+  border-radius:7px
+}
+.toolbar select {
+  min-height:38px;
+  border-radius:7px;
+  font-size:13px
+}
+.status,
+.download-status {
+  border:1px solid #e1e5e9;
+  border-left:3px solid #fe2c55;
+  border-radius:8px;
+  box-shadow:0 4px 14px #18202a08
+}
+@media(max-width:520px) {
+  .tabs {
+    width:100%;
+    gap:3px
+  }
+  .tab {
+    flex:1;
+    padding:0 8px;
+    font-size:12px
+  }
+  .toolbar {
+    align-items:stretch
+  }
+  .search {
+    width:100%
+  }
+}
+
+/* 顶部动作按数据操作和下载操作分组，下载参数已经移入下载确认弹窗。 */
+.topbar-actions {
+  min-width:0
+}
+.topbar-buttons {
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:10px
+}
+.topbar-data-actions,
+.topbar-download-actions {
+  display:flex;
+  align-items:center;
+  gap:8px
+}
+.topbar-divider {
+  width:1px;
+  height:24px;
+  background:#dce1e6
+}
+.topbar-download-actions #download-all {
+  border-color:#fe2c55;
+  color:#d91f47;
+  background:#fff7f8
+}
+.topbar-download-actions #download-all:hover:not(:disabled) {
+  color:#fff;
+  background:#fe2c55
+}
+.download-modal-settings {
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:10px;
+  margin:-8px 0 4px
+}
+.download-confirm-modal:not(.specified-download-modal) {
+  width:min(560px,calc(100vw - 32px))
+}
+.download-option {
+  display:flex;
+  flex-direction:column;
+  gap:7px;
+  min-width:0;
+  padding:11px 12px;
+  border:1px solid #e1e5e9;
+  border-radius:7px;
+  background:#f8fafb;
+  color:#66727f;
+  font-size:12px
+}
+.download-option select {
+  width:100%;
+  height:34px;
+  min-width:0;
+  padding:0 9px;
+  border:1px solid #d7dde3;
+  border-radius:6px;
+  background:#fff;
+  color:#18202a;
+  font:inherit
+}
+.download-option select:disabled {
+  color:#8b96a3;
+  background:#eef1f3
+}
+.download-option select:focus-visible {
+  outline:3px solid #fe2c5533;
+  outline-offset:1px
+}
+@media(max-width:1050px) {
+  .topbar-buttons {
+    width:100%;
+    justify-content:flex-end
+  }
+}
+@media(max-width:700px) {
+  .topbar-buttons {
+    display:grid;
+    grid-template-columns:1fr;
+    gap:8px
+  }
+  .topbar-data-actions,
+  .topbar-download-actions {
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:7px
+  }
+  .topbar-divider {
+    display:none
+  }
+  .topbar-data-actions button,
+  .topbar-download-actions button {
+    width:100%
+  }
+}
+@media(max-width:520px) {
+  .download-modal-settings {
+    grid-template-columns:1fr;
+    gap:8px
+  }
+  .download-option {
+    display:grid;
+    grid-template-columns:94px minmax(0,1fr);
+    align-items:center;
+    gap:8px
+  }
+}
