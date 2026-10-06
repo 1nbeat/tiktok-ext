@@ -4,6 +4,8 @@
 
 项目支持同步个人页中的喜欢和收藏，也支持输入指定的抖音用户主页链接加载该用户的作品。视频和图集都可以预览、批量下载，下载任务在 Node.js 服务端后台运行。
 
+<img width="1920" height="913" alt="image" src="https://github.com/user-attachments/assets/54f33d36-3a08-49af-b301-32ae4bd25da1" />
+
 ## 功能
 
 - 同步当前抖音账号的喜欢和收藏作品。
