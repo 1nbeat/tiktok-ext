@@ -770,10 +770,10 @@ h1 {
     min-height:min(640px,calc(100vh - 32px))
   }
 }
-/** 首页标题已移除，同步按钮单独靠右对齐。 */
+/** 顶部标题与操作按钮分列对齐。 */
 .topbar {
   align-items:center;
-  justify-content:flex-end
+  justify-content:space-between
 }
 /** 图集横向浏览时保持每张图片独立尺寸，避免多张图片被压缩到同一行。 */
 .modal-images img {

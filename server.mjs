@@ -62,7 +62,7 @@ async function connectCdp(url) {
 
 const pageScript = `(async () => {
   // 这段脚本在抖音页面内执行：优先调用列表接口分页，失败时再使用页面滚动兜底。
-  const result = { like: false, collect: false, order: { like: [], collect: [] }, items: { like: [], collect: [] } };
+  const result = { like: false, collect: false, api: { like: false, collect: false }, order: { like: [], collect: [] }, items: { like: [], collect: [] } };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const itemIds = { like: new Set(), collect: new Set() };
   const click = text => {
@@ -271,6 +271,7 @@ const pageScript = `(async () => {
     }
     if (!reachedEnd) throw new Error('接口分页超过安全上限');
     if (!result.order[phase].length && phase === 'like') throw new Error('喜欢接口没有返回数据');
+    result.api[phase] = true;
     return true;
   };
   const resetScroll = () => {
@@ -322,17 +323,17 @@ const pageScript = `(async () => {
   };
   // 先切走再切回，确保页面打开时已经停留在目标标签也会重新触发请求。
   click('收藏');
-  await sleep(350);
+  await sleep(120);
   result.like = click('喜欢');
-  await sleep(650);
+  await sleep(120);
   try { await loadByApi('like'); } catch (error) {
     console.warn('喜欢接口分页失败，回退页面滚动：' + error.message);
     await loadAllVisiblePages('like');
   }
   result.collect = click('收藏');
-  await sleep(450);
+  await sleep(120);
   click('视频');
-  await sleep(650);
+  await sleep(120);
   try { await loadByApi('collect'); } catch (error) {
     console.warn('收藏接口分页失败，回退页面滚动：' + error.message);
     await loadAllVisiblePages('collect');
@@ -343,11 +344,63 @@ const pageScript = `(async () => {
 // 在已经打开的抖音用户主页中滚动作品列表。作品数据由 CDP Network 事件读取，
 // 这里主要负责触发虚拟列表加载，并通过控制台事件报告进度。
 const userPageScript = `(async () => {
+  const result = { items: [], api: false };
+  const itemIds = new Set();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const click = text => {
     const el = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && e.textContent.trim() === text);
     if (el) { el.click(); return true; }
     return false;
+  };
+  const firstUrl = value => typeof value === 'string' ? value : value?.url_list?.[0] || value?.download_url_list?.[0] || value?.url || '';
+  const compactItem = item => {
+    const video = item?.video || {};
+    const imageSources = [item?.images, item?.image_list, item?.image_infos];
+    const imageEntries = imageSources.find(images => Array.isArray(images) && images.length) || [];
+    const images = [];
+    const imageKeys = new Set();
+    for (const image of imageEntries) {
+      const url = firstUrl(image);
+      const key = String(image?.uri || url);
+      if (url && !imageKeys.has(key)) { imageKeys.add(key); images.push(url); }
+    }
+    const durationMs = Number(video.duration ?? item?.duration ?? 0);
+    const isImage = Number(item?.aweme_type) === 68 || (images.length > 0 && durationMs <= 0);
+    const author = item?.author || item?.author_info || {};
+    const stats = item?.statistics || {};
+    const id = String(item?.aweme_id || item?.group_id || '');
+    return {
+      id, source: 'user', mediaType: isImage ? 'image' : 'video', imageCount: isImage ? images.length : 0,
+      title: item?.desc || (isImage ? '鏈懡鍚嶅浘闆�' : '鏈懡鍚嶈棰�'),
+      author: author.nickname || author.unique_id || '鏈煡浣滃��', authorId: String(author.uid || author.sec_uid || ''),
+      authorAvatar: firstUrl(author?.avatar_thumb) || firstUrl(author?.avatar_larger), authorUniqueId: author.unique_id || '',
+      authorShortId: author.short_id || '', authorSignature: author.signature || '',
+      authorFollowers: Number(author.follower_count || 0), authorFollowing: Number(author.following_count || 0),
+      authorTotalFavorited: Number(author.total_favorited || 0), authorAwemeCount: Number(author.aweme_count || 0),
+      authorProfile: {
+        uid: String(author.uid || ''), secUid: String(author.sec_user_id || author.sec_uid || ''), uniqueId: author.unique_id || '',
+        shortId: author.short_id || '', nickname: author.nickname || '', signature: author.signature || '',
+        gender: typeof author.gender === 'number' ? author.gender : 0, genderText: author.gender_name || author.gender_text || '',
+        age: Number(author.age || author.user_age || item?.author_age || item?.user_age || item?.age || 0), birthday: author.birthday || '',
+        country: author.country || '', province: author.province || '', city: author.city || '', district: author.district || author.county || '',
+        location: author.location || author.region || '', ipLocation: author.ip_location || author.ip_location_text || item?.ip_label || '',
+        school: author.school_name || '', verification: author.custom_verify || author.enterprise_verify_reason || '',
+        verificationType: Number(author.verification_type || 0), verified: Boolean(author.is_verified), displayId: author.display_id || '',
+        followerCount: Number(author.follower_count || 0), followingCount: Number(author.following_count || 0),
+        favoritingCount: Number(author.favoriting_count || 0), totalFavorited: Number(author.total_favorited || 0),
+        awemeCount: Number(author.aweme_count || 0), followStatus: Number(author.follow_status || 0), cover: firstUrl(author?.cover_url),
+        avatar: firstUrl(author?.avatar_larger) || firstUrl(author?.avatar_medium)
+      },
+      duration: Math.round(durationMs / 1000),
+      cover: isImage ? (images[0] || firstUrl(video?.cover) || firstUrl(video?.origin_cover)) : (firstUrl(video?.cover) || firstUrl(video?.origin_cover) || images[0] || ''),
+      images, playUrl: firstUrl(video?.play_addr) || firstUrl(video?.download_addr),
+      playUrls: [...new Set([...(video?.play_addr?.url_list || []), ...(video?.download_addr?.url_list || [])])],
+      qualities: [], likes: Number(stats.digg_count || 0), comments: Number(stats.comment_count || 0),
+      shares: Number(stats.share_count || 0), plays: Number(stats.play_count || 0), collects: Number(stats.collect_count || 0),
+      recommends: Number(stats.recommend_count || 0), downloads: Number(stats.download_count || 0),
+      createdAt: item?.create_time ? new Date(Number(item.create_time) * 1000).toISOString() : '',
+      url: item?.share_url || 'https://www.douyin.com/video/' + id
+    };
   };
   // 首先主动请求用户作品分页，确保首屏已经加载完成时仍能捕获作品数据。
   const loadApiPages = async () => {
@@ -361,9 +414,15 @@ const userPageScript = `(async () => {
         sec_user_id: secUserId, count: '18', max_cursor: String(cursor),
         locate_query: 'false', publish_time: '0', show_live_replay_strategy: '1'
       });
-      const response = await fetch('/aweme/v1/web/aweme/post/?' + query.toString(), { credentials: 'include', cache: 'no-store' });
+      const response = await fetch('/aweme/v1/web/aweme/post/?' + query.toString(), {
+        credentials: 'include', cache: 'no-store', headers: { 'x-dy-sync-api': 'direct' }
+      });
       if (!response.ok) throw new Error('用户作品接口请求失败（' + response.status + '）');
       const data = await response.json();
+      for (const item of data?.aweme_list || []) {
+        const normalized = compactItem(item);
+        if (normalized.id && !itemIds.has(normalized.id)) { itemIds.add(normalized.id); result.items.push(normalized); }
+      }
       if (!Array.isArray(data?.aweme_list)) throw new Error('用户作品接口返回格式异常');
       console.log('__DY_PROFILE_PROGRESS__', page + 1, 220, data.aweme_list.length);
       if (!data.has_more) return;
@@ -378,10 +437,10 @@ const userPageScript = `(async () => {
     .filter(el => el.scrollHeight - el.clientHeight > 300)
     .sort((a, b) => b.scrollHeight - a.scrollHeight);
   click('作品');
-  await sleep(700);
+  await sleep(120);
   let apiLoaded = false;
   try { await loadApiPages(); apiLoaded = true; } catch (error) { console.warn('用户作品接口分页失败：' + error.message); }
-  if (apiLoaded) return { ok: true, mode: 'api' };
+  if (apiLoaded) { result.api = true; return result; }
   let stableRounds = 0;
   let previousHeight = 0;
   for (let page = 0; page < 240; page += 1) {
@@ -1276,6 +1335,13 @@ async function syncFromChrome(onProgress = () => {}) {
     const evaluation = await cdpCall(ws, 'Runtime.evaluate', { expression: pageScript, returnByValue: true, awaitPromise: true });
     const pageResult = evaluation.result?.value || {};
     const domOrder = pageResult.order || { like: [], collect: [] };
+    if (pageResult.api?.like && pageResult.api?.collect) {
+      return {
+        like: (pageResult.items?.like || []).map(item => ({ ...item, source: 'like' })),
+        collect: (pageResult.items?.collect || []).map(item => ({ ...item, source: 'collect' })),
+        syncedAt: new Date().toISOString()
+      };
+    }
     // 页面脚本已经等待接口返回；只留出短暂时间让最后一个 loadingFinished 事件入队。
     // 通过循环排空当前 Promise，避免固定等待数秒，也避免遗漏并发响应体。
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -1382,6 +1448,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
     ws.responseUrls = new Map();
     ws.responseBodies = new Map();
     ws.responseBodyPromises = [];
+    ws.skipResponseBodies = new Set();
     ws.onEvent = event => {
       if (event.method === 'Runtime.consoleAPICalled') {
         const values = event.params.args.map(arg => arg.value);
@@ -1392,10 +1459,14 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
           onProgress({ progress: Math.min(99, Math.round(current * 100 / total)), pages: current, count, message: `正在加载用户作品（已发现 ${count} 条）` });
         }
       }
-      if (event.method === 'Network.responseReceived' && /\/aweme\/v1\/web\//i.test(event.params.response.url)) {
+      if (event.method === 'Network.requestWillBeSent' && /\/aweme\/v1\/web\/aweme\/post\//i.test(event.params.request.url)) {
+        const headers = event.params.request.headers || {};
+        if (headers['x-dy-sync-api'] === 'direct' || headers['X-Dy-Sync-Api'] === 'direct') ws.skipResponseBodies.add(event.params.requestId);
+      }
+      if (event.method === 'Network.responseReceived' && /\/aweme\/v1\/web\/aweme\/post\//i.test(event.params.response.url)) {
         ws.responseUrls.set(event.params.requestId, event.params.response.url);
       }
-      if (event.method === 'Network.loadingFinished' && ws.responseUrls.has(event.params.requestId)) {
+      if (event.method === 'Network.loadingFinished' && ws.responseUrls.has(event.params.requestId) && !ws.skipResponseBodies.has(event.params.requestId)) {
         const requestId = event.params.requestId;
         const bodyPromise = cdpCall(ws, 'Network.getResponseBody', { requestId }).then(body => {
           try {
@@ -1425,9 +1496,14 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
         lastEvaluationError = error;
         if (!/execution context was destroyed|cannot find context|context.*destroyed/i.test(String(error?.message || error))) throw error;
       }
-      await new Promise(resolve => setTimeout(resolve, 700));
+      await new Promise(resolve => setTimeout(resolve, 300));
     }
     if (!evaluation || evaluation.exceptionDetails) throw lastEvaluationError || new Error('用户主页脚本执行失败');
+    const pageResult = evaluation.result?.value || {};
+    if (pageResult.api && Array.isArray(pageResult.items) && pageResult.items.length) {
+      onProgress({ progress: 100, pages: 0, count: pageResult.items.length, message: 'User works loaded (' + pageResult.items.length + ')' });
+      return { items: pageResult.items, profileUrl: target.href, syncedAt: new Date().toISOString() };
+    }
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const pending = ws.responseBodyPromises.slice();
       await Promise.allSettled(pending);
@@ -1437,6 +1513,9 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
       }
     }
     const items = new Map();
+    for (const item of pageResult.items || []) {
+      if (item?.id && !items.has(item.id)) items.set(item.id, { ...item, source: 'user' });
+    }
     for (const { data } of ws.responseBodies.values()) {
       for (const item of data.aweme_list || []) {
         const normalized = itemFromAweme(item, 'user');
