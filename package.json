@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/live-photos.test.mjs"
+    "test": "node --test"
   }
 }

@@ -426,6 +426,8 @@ const userPageScript = `(async () => {
     for (let page = 0; page < 220; page += 1) {
       const query = new URLSearchParams({
         device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
+        // 与抖音主页一致，缺少该策略参数时接口会过滤部分实况图作品。
+        publish_video_strategy_type: '2',
         sec_user_id: secUserId, count: '18', max_cursor: String(cursor),
         locate_query: 'false', publish_time: '0', show_live_replay_strategy: '1'
       });
@@ -439,7 +441,7 @@ const userPageScript = `(async () => {
         if (normalized.id && !itemIds.has(normalized.id)) { itemIds.add(normalized.id); result.items.push(normalized); }
       }
       if (!Array.isArray(data?.aweme_list)) throw new Error('用户作品接口返回格式异常');
-      console.log('__DY_PROFILE_PROGRESS__', page + 1, 220, data.aweme_list.length);
+      console.log('__DY_PROFILE_PROGRESS__', page + 1, 220, result.items.length);
       if (!data.has_more) return;
       const next = Number(data.max_cursor);
       if (!Number.isFinite(next) || seen.has(String(next))) throw new Error('用户作品接口游标异常');
