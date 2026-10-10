@@ -144,7 +144,7 @@
           准备下载喜欢的作品
         </h2>
         <p class="download-confirm-description">
-          视频保存为 MP4，图集可以按作品分文件夹或与视频放在同一目录。任务会在后台运行，页面关闭后也不会中断。
+          视频保存为 MP4，实况图同时保存图片和 MP4 动态片段。图集可以按作品分文件夹或与视频放在同一目录，任务会在后台运行。
         </p>
         <div class="download-modal-settings" aria-label="批量下载设置">
           <label class="download-option" for="download-quality">
@@ -293,6 +293,7 @@
               </button>
               <div class="modal-image-stage">
                 <img id="modal-image" alt="" tabindex="0" role="button" aria-label="点击放大图片" />
+                <video id="modal-live-video" controls loop muted playsinline preload="metadata" hidden></video>
               </div>
               <button id="modal-image-next" class="image-nav image-nav-next" type="button" aria-label="下一张图片">
                 &#8250;
@@ -300,6 +301,7 @@
               <span id="modal-image-count" class="modal-image-count" aria-live="polite">
               </span>
               <div class="image-actions">
+                <button id="modal-image-live-toggle" type="button" hidden>播放实况</button>
                 <button id="modal-image-download-current" type="button">
                   下载当前
                 </button>

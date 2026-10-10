@@ -60,7 +60,35 @@ async function connectCdp(url) {
   return ws;
 }
 
+// 列表脚本和详情解析共用图片提取逻辑，保留实况图 images[n].video 的动态资源。
+function imageMediaFromAweme(item, isMediaUrl) {
+  const sources = [item?.images, item?.image_list, item?.image_infos];
+  const entries = sources.find(images => Array.isArray(images) && images.length) || [];
+  const media = [];
+  const keys = new Set();
+  for (const image of entries) {
+    const imageUrl = typeof image === 'string' ? image : image?.url_list?.[0] || image?.download_url_list?.[0] || image?.url || '';
+    const key = String(image?.uri || imageUrl);
+    if (!imageUrl || keys.has(key)) continue;
+    keys.add(key);
+    const video = image?.video || {};
+    const rates = [...(video.bit_rate || [])].sort((a, b) => Number(b?.bit_rate || 0) - Number(a?.bit_rate || 0));
+    // 优先 H.264，保证浏览器和常用播放器能播放实况片段。
+    const videoUrls = [...new Set([
+      ...(video.play_addr_h264?.url_list || []),
+      ...rates.flatMap(rate => rate?.play_addr?.url_list || []),
+      ...(video.play_addr?.url_list || []),
+      ...(video.download_addr?.url_list || [])
+    ].filter(isMediaUrl))];
+    media.push({ imageUrl, videoUrl: videoUrls[0] || '', videoUrls,
+      isLivePhoto: Number(image?.live_photo_type) > 0 || videoUrls.length > 0 });
+  }
+  return media;
+}
+
 const pageScript = `(async () => {
+  const imageMediaFromAweme = ${imageMediaFromAweme.toString()};
+  const isDouyinMediaUrl = ${isDouyinMediaUrl.toString()};
   // 这段脚本在抖音页面内执行：优先调用列表接口分页，失败时再使用页面滚动兜底。
   const result = { like: false, collect: false, api: { like: false, collect: false }, order: { like: [], collect: [] }, items: { like: [], collect: [] } };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -73,19 +101,8 @@ const pageScript = `(async () => {
   const compactItem = (item, source) => {
     // 只把展示需要的字段带回服务端，避免几百个完整 aweme JSON 挤满 Chrome 响应缓存。
     const video = item?.video || {};
-    // 一张图片会返回多个 CDN 地址，只取每个图片对象的第一个地址，避免弹窗重复显示。
-    const imageSources = [item?.images, item?.image_list, item?.image_infos];
-    const imageEntries = imageSources.find(images => Array.isArray(images) && images.length) || imageSources.find(Array.isArray) || [];
-    const images = [];
-    const imageKeys = new Set();
-    for (const image of imageEntries) {
-      const url = typeof image === 'string' ? image : image?.url_list?.[0] || image?.download_url_list?.[0] || image?.url || '';
-      const key = String(image?.uri || url);
-      if (url && !imageKeys.has(key)) {
-        imageKeys.add(key);
-        images.push(url);
-      }
-    }
+    const imageMedia = imageMediaFromAweme(item, isDouyinMediaUrl);
+    const images = imageMedia.map(image => image.imageUrl);
     const durationMs = Number(video.duration ?? item?.duration ?? 0);
     const isImage = Number(item?.aweme_type) === 68 || (images.length > 0 && durationMs <= 0);
     const author = item?.author || item?.author_info || {};
@@ -141,6 +158,8 @@ const pageScript = `(async () => {
       duration: Math.round(durationMs / 1000),
       cover: isImage ? (images[0] || video?.cover?.url_list?.[0] || video?.origin_cover?.url_list?.[0] || '') : (video?.cover?.url_list?.[0] || video?.origin_cover?.url_list?.[0] || images[0] || ''),
       images,
+      imageMedia,
+      livePhotoCount: imageMedia.filter(image => image.isLivePhoto).length,
       playUrl: video?.play_addr?.url_list?.[0] || video?.download_addr?.url_list?.[0] || '',
       likes: Number(stats.digg_count || 0),
       comments: Number(stats.comment_count || 0),
@@ -344,6 +363,8 @@ const pageScript = `(async () => {
 // 在已经打开的抖音用户主页中滚动作品列表。作品数据由 CDP Network 事件读取，
 // 这里主要负责触发虚拟列表加载，并通过控制台事件报告进度。
 const userPageScript = `(async () => {
+  const imageMediaFromAweme = ${imageMediaFromAweme.toString()};
+  const isDouyinMediaUrl = ${isDouyinMediaUrl.toString()};
   const result = { items: [], api: false };
   const itemIds = new Set();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -355,15 +376,8 @@ const userPageScript = `(async () => {
   const firstUrl = value => typeof value === 'string' ? value : value?.url_list?.[0] || value?.download_url_list?.[0] || value?.url || '';
   const compactItem = item => {
     const video = item?.video || {};
-    const imageSources = [item?.images, item?.image_list, item?.image_infos];
-    const imageEntries = imageSources.find(images => Array.isArray(images) && images.length) || [];
-    const images = [];
-    const imageKeys = new Set();
-    for (const image of imageEntries) {
-      const url = firstUrl(image);
-      const key = String(image?.uri || url);
-      if (url && !imageKeys.has(key)) { imageKeys.add(key); images.push(url); }
-    }
+    const imageMedia = imageMediaFromAweme(item, isDouyinMediaUrl);
+    const images = imageMedia.map(image => image.imageUrl);
     const durationMs = Number(video.duration ?? item?.duration ?? 0);
     const isImage = Number(item?.aweme_type) === 68 || (images.length > 0 && durationMs <= 0);
     const author = item?.author || item?.author_info || {};
@@ -393,7 +407,8 @@ const userPageScript = `(async () => {
       },
       duration: Math.round(durationMs / 1000),
       cover: isImage ? (images[0] || firstUrl(video?.cover) || firstUrl(video?.origin_cover)) : (firstUrl(video?.cover) || firstUrl(video?.origin_cover) || images[0] || ''),
-      images, playUrl: firstUrl(video?.play_addr) || firstUrl(video?.download_addr),
+      images, imageMedia, livePhotoCount: imageMedia.filter(image => image.isLivePhoto).length,
+      playUrl: firstUrl(video?.play_addr) || firstUrl(video?.download_addr),
       playUrls: [...new Set([...(video?.play_addr?.url_list || []), ...(video?.download_addr?.url_list || [])])],
       qualities: [], likes: Number(stats.digg_count || 0), comments: Number(stats.comment_count || 0),
       shares: Number(stats.share_count || 0), plays: Number(stats.play_count || 0), collects: Number(stats.collect_count || 0),
@@ -465,19 +480,8 @@ const userPageScript = `(async () => {
 
 function itemFromAweme(item, source) {
   // 将抖音接口的原始 aweme 结构压缩成前端展示所需的统一字段。
-  // 同一图片的 url_list 是不同 CDN 线路，不是多张图片；每个图片对象只选一个地址。
-  const imageSources = [item?.images, item?.image_list, item?.image_infos];
-  const imageEntries = imageSources.find(images => Array.isArray(images) && images.length) || imageSources.find(Array.isArray) || [];
-  const images = [];
-  const imageKeys = new Set();
-  for (const image of imageEntries) {
-    const url = typeof image === 'string' ? image : image?.url_list?.[0] || image?.download_url_list?.[0] || image?.url || '';
-    const key = String(image?.uri || url);
-    if (url && !imageKeys.has(key)) {
-      imageKeys.add(key);
-      images.push(url);
-    }
-  }
+  const imageMedia = imageMediaFromAweme(item, isDouyinMediaUrl);
+  const images = imageMedia.map(image => image.imageUrl);
   const durationMs = Number(item?.video?.duration ?? item?.duration ?? 0);
   const isImage = Number(item?.aweme_type) === 68 || (images.length > 0 && durationMs <= 0);
   const cover = isImage
@@ -536,6 +540,8 @@ function itemFromAweme(item, source) {
     duration: Math.round(durationMs / 1000),
     cover,
     images,
+    imageMedia,
+    livePhotoCount: imageMedia.filter(image => image.isLivePhoto).length,
     // 列表接口有时已经返回可播放地址；详情接口会在点击时实时刷新它。
     playUrl: item?.video?.play_addr?.url_list?.[0] || item?.video?.download_addr?.url_list?.[0] || '',
     playUrls: playUrlsFromAweme(item),
@@ -669,7 +675,7 @@ function queueDownloadStateSave() {
 
 function publicDownloadJob(job) {
   // 只向前端暴露任务进度字段，隐藏运行时 Promise 和媒体地址缓存。
-  const exposeItem = ({ rateAt, rateBytes, playUrl, images, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
+  const exposeItem = ({ rateAt, rateBytes, playUrl, images, imageMedia, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
   return {
     id: job.id,
     status: job.status,
@@ -725,6 +731,12 @@ function registerMediaUrls(detail) {
   for (const url of detail.playUrls || []) mediaUrls.set(url, Date.now() + 15 * 60 * 1000);
   for (const option of detail.qualities || []) if (isDouyinMediaUrl(option?.url)) mediaUrls.set(option.url, Date.now() + 15 * 60 * 1000);
   for (const url of detail.images || []) mediaUrls.set(url, Date.now() + 15 * 60 * 1000);
+  for (const image of detail.imageMedia || []) {
+    if (isDouyinMediaUrl(image.imageUrl)) mediaUrls.set(image.imageUrl, Date.now() + 15 * 60 * 1000);
+    for (const url of [image.videoUrl, ...(image.videoUrls || [])]) {
+      if (isDouyinMediaUrl(url)) mediaUrls.set(url, Date.now() + 15 * 60 * 1000);
+    }
+  }
   if (isDouyinMediaUrl(detail.music?.url)) mediaUrls.set(detail.music.url, Date.now() + 15 * 60 * 1000);
   for (const [url, expiresAt] of mediaUrls) if (expiresAt < Date.now()) mediaUrls.delete(url);
 }
@@ -774,7 +786,7 @@ async function proxyMedia(req, res, value, { download = false, id = '', kind = '
   if (download) {
     // 使用稳定的 ASCII 文件名，避免不同浏览器对中文文件名的编码处理不一致。
     const extension = kind === 'image' ? (contentType.split('/')[1] || 'jpg').split(';')[0].replace(/[^a-z0-9]/gi, '') || 'jpg' : 'mp4';
-    const suffix = kind === 'image' && index ? `-${String(index).replace(/[^0-9]/g, '')}` : '';
+    const suffix = index ? `-${String(index).replace(/[^0-9]/g, '')}` : '';
     responseHeaders['content-disposition'] = `attachment; filename="douyin-${id || 'media'}${suffix}.${extension}"`;
   }
   res.writeHead(upstream.status, responseHeaders);
@@ -835,6 +847,39 @@ function updateDownloadRate(item, bytesAdded) {
 
 function safeAlbumDirectory(id) {
   return `douyin-${String(id).replace(/[^0-9]/g, '') || 'album'}`;
+}
+
+function uniqueDownloadBaseName(item, albumMode, usedFiles) {
+  const title = safeDownloadTitle(item.title, item.id);
+  const fileKeys = base => {
+    if (item.mediaType !== 'image') return [`${base}.mp4`.toLowerCase()];
+    const directory = albumMode === 'flat' ? '' : `${safeAlbumDirectory(item.id)}/`;
+    const count = Math.max(1, Number(item.imageCount) || item.imageMedia?.length || item.images?.length || 0);
+    // 为每张图片预留动态片段文件名，避免平铺时与另一个视频的标题撞名。
+    return Array.from({ length: count }, (_, index) => ['jpg', 'mp4']
+      .map(extension => `${directory}${base}-${index + 1}.${extension}`.toLowerCase())).flat();
+  };
+  let base = title;
+  let occurrence = 1;
+  while (usedFiles.has(`title:${base.toLowerCase()}`) || fileKeys(base).some(key => usedFiles.has(key))) base = `${title}-${++occurrence}`;
+  usedFiles.add(`title:${base.toLowerCase()}`);
+  for (const key of fileKeys(base)) usedFiles.add(key);
+  return base;
+}
+
+function albumFilesFromDetail(detail) {
+  const media = detail.imageMedia?.length
+    ? detail.imageMedia
+    : (detail.images || []).map(imageUrl => ({ imageUrl }));
+  return media.flatMap((image, index) => {
+    if (!isDouyinMediaUrl(image.imageUrl)) throw new Error(`第 ${index + 1} 张图片地址无效`);
+    const videoUrl = [image.videoUrl, ...(image.videoUrls || [])].find(isDouyinMediaUrl);
+    if (image.isLivePhoto && !videoUrl) throw new Error(`第 ${index + 1} 张实况图缺少动态地址，请重新获取作品详情`);
+    const files = [{ url: image.imageUrl, extension: 'jpg', imageIndex: index }];
+    if (videoUrl) files.push({ url: videoUrl, extension: 'mp4', imageIndex: index });
+    files[files.length - 1].endsImage = true;
+    return files;
+  });
 }
 
 async function downloadJobItem(job, item) {
@@ -942,7 +987,7 @@ async function downloadJobItem(job, item) {
 }
 
 async function downloadImageAlbumItem(job, item) {
-  // 按顺序下载图集中的每张图片；目录规则由创建任务时的 albumMode 固定。
+  // 实况图同时保存静态图片和动态 MP4，两份资源都完成才计为一张完成。
   const runToken = job.runToken;
   const inactive = () => job.status !== 'running' || job.cancelRequested || job.runToken !== runToken;
   const stopIfInactive = () => {
@@ -964,25 +1009,41 @@ async function downloadImageAlbumItem(job, item) {
     if (stopIfInactive()) return;
     item.attempts = attempt;
     try {
-      const detail = item.images?.length ? { images: item.images } : await getVideoDetail(item.id);
-      const images = [...new Set((detail.images || []).filter(isDouyinMediaUrl))];
-      if (!images.length) throw new Error('未获取到图集图片');
-      item.totalImages = images.length;
+      // 旧任务仅缓存静态 URL，必须刷新详情，避免继续把实况图当作普通图片。
+      const detail = item.imageMedia?.length ? item : await getVideoDetail(item.id);
+      const files = albumFilesFromDetail(detail);
+      if (!files.length) throw new Error('未获取到图集图片');
+      item.imageMedia = detail.imageMedia;
+      item.livePhotoCount = (detail.imageMedia || []).filter(image => image.isLivePhoto).length;
+      item.totalImages = files.filter(file => file.endsImage).length;
+      item.totalFiles = files.length;
+      item.completedFiles = 0;
       item.completedImages = 0;
-      for (let index = 0; index < images.length; index += 1) {
+      item.bytes = 0;
+      item.totalBytes = 0;
+      item.rateAt = 0;
+      item.rateBytes = 0;
+      item.error = null;
+      updateDownloadJob(job);
+      for (const file of files) {
         if (stopIfInactive()) return;
-        const url = images[index];
-        registerMediaUrls({ playUrls: [], images: [url] });
-        const imageName = `${item.fileBaseName || safeDownloadTitle(item.title, item.id)}-${index + 1}.jpg`;
+        const url = file.url;
+        const imageName = `${item.fileBaseName || safeDownloadTitle(item.title, item.id)}-${file.imageIndex + 1}.${file.extension}`;
         const target = path.join(folder, imageName);
         const partial = `${target}.part`;
-        try {
-          const stat = await fs.stat(target);
-          if (stat.size > 0) {
-            item.completedImages += 1;
-            continue;
-          }
-        } catch { /* 图片不存在，继续下载 */ }
+        if (job.skipExisting) {
+          try {
+            const stat = await fs.stat(target);
+            if (stat.size > 0) {
+              item.bytes += stat.size;
+              item.totalBytes += stat.size;
+              item.completedFiles += 1;
+              if (file.endsImage) item.completedImages += 1;
+              updateDownloadJob(job);
+              continue;
+            }
+          } catch { /* 文件不存在，继续下载 */ }
+        }
         let offset = 0;
         try { offset = (await fs.stat(partial)).size; } catch { /* 没有临时文件 */ }
         const headers = { referer: 'https://www.douyin.com/', origin: 'https://www.douyin.com', 'user-agent': 'Mozilla/5.0' };
@@ -994,12 +1055,15 @@ async function downloadImageAlbumItem(job, item) {
           delete headers.range;
           response = await fetch(url, { headers });
         }
-        if (!response.ok || !response.body) throw new Error(`图片下载失败（${response.status}）`);
+        if (!response.ok || !response.body) throw new Error(`${file.extension === 'mp4' ? '实况视频' : '图片'}下载失败（${response.status}）`);
         if (offset > 0 && response.status !== 206) {
           await fs.rm(partial, { force: true });
           offset = 0;
         }
         const contentLength = Number(response.headers.get('content-length') || 0);
+        const completedBytes = item.totalBytes;
+        item.bytes += offset;
+        item.totalBytes = completedBytes + offset + contentLength;
         const handle = await fs.open(partial, offset > 0 ? 'a' : 'w');
         const reader = response.body.getReader();
         try {
@@ -1012,13 +1076,15 @@ async function downloadImageAlbumItem(job, item) {
             updateDownloadJob(job);
           }
         } finally {
+          if (inactive()) await reader.cancel().catch(() => {});
           reader.releaseLock();
           await handle.close();
         }
         if (stopIfInactive()) return;
         await fs.rename(partial, target);
-        item.totalBytes = (Number(item.totalBytes) || 0) + ((response.status === 206 ? offset : 0) + contentLength);
-        item.completedImages += 1;
+        item.totalBytes = item.bytes;
+        item.completedFiles += 1;
+        if (file.endsImage) item.completedImages += 1;
         updateDownloadJob(job);
       }
       item.status = 'completed';
@@ -1027,6 +1093,7 @@ async function downloadImageAlbumItem(job, item) {
     } catch (error) {
       item.error = error.message;
       item.images = [];
+      delete item.imageMedia;
       if (attempt < DOWNLOAD_RETRIES) await new Promise(resolve => setTimeout(resolve, attempt * 1500));
     }
   }
@@ -1593,17 +1660,17 @@ const server = http.createServer(async (req, res) => {
       const source = ['like', 'collect', 'user'].includes(body.source) ? body.source : 'like';
       const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户' };
       const sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
-      const titleCounts = new Map();
+      const usedFiles = new Set();
       const items = sourceItems.filter(item => /^\d+$/.test(String(item.id)))
         .map(item => {
-          const fileBaseName = safeDownloadTitle(item.title, item.id);
-          const occurrence = (titleCounts.get(fileBaseName) || 0) + 1;
-          titleCounts.set(fileBaseName, occurrence);
+          const fileBaseName = uniqueDownloadBaseName(item, body.albumMode, usedFiles);
           return {
-            id: String(item.id), title: item.title || '', author: item.author || '', fileBaseName: occurrence > 1 ? `${fileBaseName}-${occurrence}` : fileBaseName,
+            id: String(item.id), title: item.title || '', author: item.author || '', fileBaseName,
             mediaType: item.mediaType === 'image' ? 'image' : 'video',
             playUrl: isDouyinMediaUrl(item.playUrl) ? item.playUrl : '',
             images: Array.isArray(item.images) ? item.images.filter(isDouyinMediaUrl) : [],
+            imageMedia: Array.isArray(item.imageMedia) ? item.imageMedia : undefined,
+            livePhotoCount: Number(item.livePhotoCount) || 0,
             status: 'pending', bytes: 0, totalBytes: 0, attempts: 0, error: null, path: ''
           };
         });

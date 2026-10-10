@@ -40,6 +40,7 @@ const formatDuration = seconds => {
 const formatMediaLabel = item => {
   if (item.mediaType !== 'image') return formatDuration(item.duration);
   const count = Number(item.imageCount || item.images?.length || 0);
+  if (item.livePhotoCount) return `实况 · ${count || 1}张`;
   return count > 1 ? `图集 · ${count}张` : '图集';
 };
 const formatCount = count => {
@@ -157,7 +158,7 @@ function renderDownloadJob(job) {
   const activeItems = Array.isArray(job.activeItems) ? job.activeItems : [];
   $('#download-active-list').innerHTML = activeItems.map(item => {
     const percent = item.totalBytes ? Math.min(100, Math.round(item.bytes * 100 / item.totalBytes)) : 0;
-    const type = item.mediaType === 'image' ? '图集' : '视频';
+    const type = item.mediaType === 'image' ? `${item.livePhotoCount ? '实况图集' : '图集'}${item.totalImages ? ` ${item.completedImages || 0}/${item.totalImages} 张` : ''}` : '视频';
     return `<div class="download-active-item"><div class="download-active-heading"><span class="download-active-name" title="${escapeHtml(item.title || item.id)}">${escapeHtml(item.title || item.id)}</span><span>${type} · ${formatBytes(item.bytes)} / ${item.totalBytes ? formatBytes(item.totalBytes) : '未知'} · ${formatSpeed(item.speedBps)}</span></div><div class="download-active-track"><div style="width:${percent}%"></div></div></div>`;
   }).join('');
   const running = job.status === 'running';
@@ -267,10 +268,11 @@ async function downloadJobAction(action) {
 function resetPageAndRender() { state.page = 1; render(); }
 
 // 统一生成本地媒体地址；下载参数由服务端转成附件响应。
-function buildStreamUrl(url, { download = false, id = '' } = {}) {
+function buildStreamUrl(url, { download = false, id = '', index } = {}) {
   const params = new URLSearchParams({ url });
   if (download) params.set('download', '1');
   if (id) params.set('id', id);
+  if (index !== undefined) params.set('index', String(index + 1));
   return `/api/video/stream?${params.toString()}`;
 }
 
@@ -453,7 +455,7 @@ function renderModalInfo(item) {
   if (item.collects) meta.push(['collect', `收藏 ${formatCount(item.collects)}`]);
   if (item.recommends) meta.push(['recommend', `推荐 ${formatCount(item.recommends)}`]);
   meta.push(item.mediaType === 'image'
-    ? ['album', `图集 ${Number(item.imageCount || item.images?.length || 1)} 张`]
+    ? ['album', `图集 ${Number(item.imageCount || item.images?.length || 1)} 张${item.livePhotoCount ? ` · 实况 ${item.livePhotoCount} 张` : ''}`]
     : item.duration ? ['duration', `时长 ${formatDuration(item.duration)}`] : ['album', '图集']);
   $('#modal-meta').innerHTML = meta.map(([icon, value]) => `<span class="modal-meta-item modal-meta-${icon}"><i class="modal-meta-icon" aria-hidden="true"></i>${escapeHtml(value)}</span>`).join('');
   const originalLink = $('#modal-original-link');
@@ -475,6 +477,7 @@ function renderModalInfo(item) {
 function resetModalPlayer() {
   const video = $('#modal-video');
   const audio = $('#modal-audio');
+  const liveVideo = $('#modal-live-video');
   playerSourceId += 1;
   selectedDetail = null;
   selectedQuality = null;
@@ -489,6 +492,13 @@ function resetModalPlayer() {
   audio.load();
   audio.hidden = true;
   video.hidden = true;
+  liveVideo.pause();
+  liveVideo.removeAttribute('src');
+  liveVideo.removeAttribute('poster');
+  liveVideo.load();
+  liveVideo.hidden = true;
+  $('#modal-image').hidden = false;
+  $('#modal-image-live-toggle').hidden = true;
   $('#modal-images').hidden = true;
   $('#modal-image').removeAttribute('src');
   $('#modal-image').alt = '';
@@ -516,11 +526,25 @@ function updateImageGallery(title = '') {
   const image = $('#modal-image');
   image.src = imageUrls[imageIndex];
   image.alt = title || '图集图片';
-  $('#modal-image-count').textContent = `${imageIndex + 1} / ${imageUrls.length}`;
+  const media = selectedDetail?.imageMedia?.find(entry => entry.imageUrl === imageUrls[imageIndex]);
+  const liveVideo = $('#modal-live-video');
+  liveVideo.pause();
+  liveVideo.removeAttribute('src');
+  liveVideo.removeAttribute('poster');
+  if (media?.videoUrl) {
+    liveVideo.src = buildStreamUrl(media.videoUrl, { id: selectedDetail.id });
+    liveVideo.poster = imageUrls[imageIndex];
+  }
+  liveVideo.load();
+  $('#modal-image-live-toggle').hidden = !media?.videoUrl;
+  showLivePhoto(Boolean(media?.videoUrl));
+  $('#modal-image-count').textContent = `${imageIndex + 1} / ${imageUrls.length}${media?.isLivePhoto ? ' · 实况' : ''}`;
   const hasMultiple = imageUrls.length > 1;
   $('#modal-image-prev').hidden = !hasMultiple;
   $('#modal-image-next').hidden = !hasMultiple;
   $('#modal-image-download-current').hidden = false;
+  $('#modal-image-download-current').textContent = media?.isLivePhoto ? '下载实况' : '下载当前';
+  $('#modal-image-download-current').title = media?.isLivePhoto ? '保存静态图片和 MP4 动态片段' : '保存当前图片';
   $('#modal-image-download-all').hidden = false;
   const lightbox = $('#image-lightbox');
   if (lightbox.open) {
@@ -529,6 +553,15 @@ function updateImageGallery(title = '') {
     lightboxImage.alt = image.alt;
     resetLightboxZoom();
   }
+}
+
+function showLivePhoto(show) {
+  const video = $('#modal-live-video');
+  video.hidden = !show;
+  $('#modal-image').hidden = show;
+  $('#modal-image-live-toggle').textContent = show ? '查看静态' : '播放实况';
+  if (show) video.play().catch(() => { /* 保留控件，供用户手动播放。 */ });
+  else video.pause();
 }
 
 // 规范化图集图片地址并初始化当前图片索引。
@@ -553,21 +586,40 @@ function openImageLightbox() {
   if (!lightbox.open) lightbox.showModal();
 }
 
-// 通过本地媒体代理触发单张图片下载，避免跨域限制。
+// 保存实况图的图片和动态片段，使用相同作品 ID 和序号对应两份文件。
+function imageDownloadAssets(index) {
+  if (!selectedDetail || !imageUrls[index]) return [];
+  const id = selectedDetail.id;
+  const media = selectedDetail.imageMedia?.find(entry => entry.imageUrl === imageUrls[index]);
+  const assets = [{ href: buildImageUrl(imageUrls[index], { download: true, id, index }), filename: `douyin-${id}-${index + 1}` }];
+  if (media?.isLivePhoto && !media.videoUrl) {
+    $('#modal-error').textContent = '该实况图缺少动态地址，请重新打开作品后下载';
+    return [];
+  }
+  if (media?.videoUrl) assets.push({ href: buildStreamUrl(media.videoUrl, { download: true, id, index }), filename: `douyin-${id}-${index + 1}.mp4` });
+  return assets;
+}
+
+function downloadImageAssets(assets) {
+  // 预先固定地址，切换图片或关闭弹窗不会把尚未触发的下载替换为其他作品。
+  assets.forEach((asset, index) => setTimeout(() => {
+    const link = document.createElement('a');
+    link.href = asset.href;
+    link.download = asset.filename;
+    link.rel = 'noopener';
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }, index * 180));
+}
+
 function downloadImage(index) {
-  if (!selectedDetail || !imageUrls[index]) return;
-  const link = document.createElement('a');
-  link.href = buildImageUrl(imageUrls[index], { download: true, id: selectedDetail.id, index });
-  link.download = `douyin-${selectedDetail.id}-${index + 1}`;
-  link.rel = 'noopener';
-  document.body.append(link);
-  link.click();
-  link.remove();
+  downloadImageAssets(imageDownloadAssets(index));
 }
 
 // 浏览器可能限制批量下载权限，因此每张图片间隔触发，避免请求瞬间拥塞。
 function downloadAllImages() {
-  imageUrls.forEach((_, index) => setTimeout(() => downloadImage(index), index * 180));
+  downloadImageAssets(imageUrls.flatMap((_, index) => imageDownloadAssets(index)));
 }
 
 // 设置当前清晰度，切换时尽量恢复原来的播放位置和播放状态。
@@ -772,6 +824,7 @@ $('#image-lightbox-image').addEventListener('pointercancel', endLightboxDrag);
 $('#image-lightbox-image').addEventListener('dblclick', () => setLightboxScale(lightboxScale > 1 ? 1 : 2));
 $('#modal-image-download-current').addEventListener('click', () => downloadImage(imageIndex));
 $('#modal-image-download-all').addEventListener('click', downloadAllImages);
+$('#modal-image-live-toggle').addEventListener('click', () => showLivePhoto($('#modal-live-video').hidden));
 
 // 图集弹窗支持左右按钮和键盘方向键切换。
 $('#modal-images').addEventListener('click', event => {
