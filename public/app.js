@@ -105,6 +105,7 @@ function render() {
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
   const workCount = sourceItems.length;
   $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(downloadJob?.status);
+  $('#download-specified').disabled = ['running', 'pending'].includes(downloadJob?.status);
   $('#download-all').textContent = workCount ? `批量下载当前列表（${workCount}）` : '批量下载当前列表';
   const grid = $('#grid');
   if (!items.length) {
@@ -141,6 +142,7 @@ function renderDownloadJob(job) {
   downloadJob = job;
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
   $('#download-all').disabled = sourceItems.length === 0 || ['running', 'pending'].includes(job?.status);
+  $('#download-specified').disabled = ['running', 'pending'].includes(job?.status);
   const panel = $('#download-status');
   panel.hidden = !job || isDismissedDownloadJob(job);
   if (!job) return;
@@ -149,7 +151,8 @@ function renderDownloadJob(job) {
   if (job.concurrency) $('#download-concurrency').value = String(Math.min(10, Math.max(1, job.concurrency)));
   if (job.quality) $('#download-quality').value = job.quality === 'standard' ? 'standard' : 'highest';
   $('#download-album-mode').value = job.albumMode === 'flat' ? 'flat' : 'folder';
-  const label = job.status === 'completed' ? '批量下载完成' : job.status === 'completed_with_errors' ? '批量下载完成（有失败项）' : job.status === 'failed' ? '批量下载失败' : job.status === 'cancelled' ? '批量下载已取消' : '批量下载';
+  const taskLabel = job.source === 'specified' ? '作品下载' : '批量下载';
+  const label = job.status === 'completed' ? `${taskLabel}完成` : job.status === 'completed_with_errors' ? `${taskLabel}完成（有失败项）` : job.status === 'failed' ? `${taskLabel}失败` : job.status === 'cancelled' ? `${taskLabel}已取消` : taskLabel;
   $('#download-title').textContent = label;
   const activeConcurrency = Number(job.activeConcurrency || 0);
   $('#download-summary').textContent = `${finished}/${job.total} 个作品 · 成功 ${job.completed} · 跳过 ${job.skipped} · 失败 ${job.failed} · 实际并发 ${activeConcurrency}/${job.concurrency}`;
@@ -184,21 +187,21 @@ async function pollDownloadJob(id) {
   } catch (error) { $('#download-detail').textContent = error.message; }
 }
 
-async function createDownloadJob() {
-  // 使用当前标签的全部作品创建批量下载任务。
-  const source = ['like', 'collect', 'user'].includes(state.source) ? state.source : 'like';
-  const works = Array.isArray(state[source]) ? state[source] : [];
+async function createDownloadJob({ detail } = {}) {
+  // 列表和指定作品共用下载设置、后台任务和进度面板。
+  const source = detail ? 'specified' : ['like', 'collect', 'user'].includes(state.source) ? state.source : 'like';
+  const works = detail ? [detail] : Array.isArray(state[source]) ? state[source] : [];
   if (!works.length) return;
   const initialQuality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const initialConcurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
   const initialAlbumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
-  const confirmed = await requestDownloadConfirmation(source, initialQuality, initialConcurrency, initialAlbumMode);
+  const confirmed = await requestDownloadConfirmation(source, works, initialQuality, initialConcurrency, initialAlbumMode);
   if (!confirmed) return;
   const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
   const albumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
   clearDismissedDownloadJob();
-  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, quality, concurrency, albumMode, skipExisting: true }) });
+  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, id: detail?.id, quality, concurrency, albumMode, skipExisting: true }) });
   const job = await response.json();
   if (!response.ok) throw new Error(job.error || '创建下载任务失败');
   renderDownloadJob(job);
@@ -206,13 +209,12 @@ async function createDownloadJob() {
   pollDownloadJob(job.id);
 }
 
-function requestDownloadConfirmation(source, quality, concurrency, albumMode) {
+function requestDownloadConfirmation(source, works, quality, concurrency, albumMode) {
   // 打开自定义确认弹窗，并等待用户明确选择开始或取消。
   const modal = $('#download-confirm-modal');
-  const works = Array.isArray(state[source]) ? state[source] : [];
   const videoCount = works.filter(item => item.mediaType !== 'image').length;
   const imageCount = works.filter(item => item.mediaType === 'image').length;
-  const sourceLabel = source === 'user' ? '用户作品' : source === 'collect' ? '收藏作品' : '喜欢的作品';
+  const sourceLabel = source === 'specified' ? '指定作品' : source === 'user' ? '用户作品' : source === 'collect' ? '收藏作品' : '喜欢的作品';
   $('#download-confirm-title').textContent = `准备下载${sourceLabel}`;
   $('#download-quality').value = quality;
   $('#download-concurrency').value = String(concurrency);
@@ -852,7 +854,7 @@ $('.tabs').addEventListener('click', event => {
 // 搜索和排序只作用于当前标签的数据。
 $('#search').addEventListener('input', event => { state.query = event.target.value; resetPageAndRender(); });
 $('#sort').addEventListener('change', event => { state.sort = event.target.value; resetPageAndRender(); });
-// 指定下载只负责解析链接，详情展示和播放继续复用现有作品弹窗。
+// 指定作品解析完成后，使用与批量下载相同的确认弹窗和服务端任务。
 $('#download-specified').addEventListener('click', () => {
   const modal = $('#specified-download-modal');
   $('#specified-download-url').value = '';
@@ -868,6 +870,7 @@ $('#specified-download-modal').addEventListener('click', event => {
 $('#specified-download-open').addEventListener('click', async () => {
   const input = $('#specified-download-url');
   const button = $('#specified-download-open');
+  if (button.disabled) return;
   const id = extractDouyinWorkId(input.value);
   if (!id) {
     $('#specified-download-error').textContent = '无法从该内容解析作品 ID，请检查链接后重试';
@@ -875,12 +878,26 @@ $('#specified-download-open').addEventListener('click', async () => {
     return;
   }
   button.disabled = true;
+  button.textContent = '正在解析...';
   $('#specified-download-error').textContent = '';
-  $('#specified-download-modal').close();
   try {
-    await openVideo({ id, title: '指定作品', author: '', mediaType: 'video' });
+    const response = await fetch(`/api/video?id=${encodeURIComponent(id)}`);
+    const detail = await response.json();
+    if (!response.ok) throw new Error(detail.error || '解析作品失败');
+    // 用户关闭输入窗口后，不再打开下载确认窗口。
+    if (!$('#specified-download-modal').open) return;
+    $('#specified-download-modal').close();
+    await createDownloadJob({ detail });
+  } catch (error) {
+    if ($('#specified-download-modal').open) {
+      $('#specified-download-error').textContent = error.message;
+    } else {
+      $('#download-status').hidden = false;
+      $('#download-detail').textContent = error.message;
+    }
   } finally {
     button.disabled = false;
+    button.textContent = '解析作品';
   }
 });
 $('#specified-download-url').addEventListener('keydown', event => {

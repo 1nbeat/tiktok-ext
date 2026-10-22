@@ -677,7 +677,7 @@ function queueDownloadStateSave() {
 
 function publicDownloadJob(job) {
   // 只向前端暴露任务进度字段，隐藏运行时 Promise 和媒体地址缓存。
-  const exposeItem = ({ rateAt, rateBytes, playUrl, images, imageMedia, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
+  const exposeItem = ({ rateAt, rateBytes, playUrl, qualities, images, imageMedia, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
   return {
     id: job.id,
     status: job.status,
@@ -926,9 +926,15 @@ async function downloadJobItem(job, item) {
     if (stopIfInactive()) return;
     item.attempts = attempt;
     try {
-      const detail = item.playUrl
-        ? { playUrl: item.playUrl, playUrls: [item.playUrl], qualities: [] }
-        : await getVideoDetail(item.id);
+      let detail = item;
+      if (!item.qualities?.length) {
+        try {
+          detail = await getVideoDetail(item.id);
+        } catch (error) {
+          // 详情暂不可用时仍允许使用已有的播放地址。
+          if (!isDouyinMediaUrl(item.playUrl)) throw error;
+        }
+      }
       const options = getQualityOptionsForServer(detail, job.quality);
       const url = options[0];
       if (!url || !isDouyinMediaUrl(url)) throw new Error('未获取到可下载的视频地址');
@@ -981,6 +987,7 @@ async function downloadJobItem(job, item) {
     } catch (error) {
       item.error = error.message;
       item.playUrl = '';
+      item.qualities = [];
       if (attempt < DOWNLOAD_RETRIES) await new Promise(resolve => setTimeout(resolve, attempt * 1500));
     }
   }
@@ -1659,9 +1666,15 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/api/sync') return send(res, 200, JSON.stringify(latestData));
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const source = ['like', 'collect', 'user'].includes(body.source) ? body.source : 'like';
-      const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户' };
-      const sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
+      const source = ['like', 'collect', 'user', 'specified'].includes(body.source) ? body.source : 'like';
+      const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户', specified: '指定' };
+      let sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
+      if (source === 'specified') {
+        const id = String(body.id || '');
+        if (!/^\d+$/.test(id)) return send(res, 400, JSON.stringify({ error: '缺少有效的作品 ID' }));
+        // 由服务端获取真实标题和媒体类型，再复用列表下载的命名及保存逻辑。
+        sourceItems = [await getVideoDetail(id)];
+      }
       const usedFiles = new Set();
       const items = sourceItems.filter(item => /^\d+$/.test(String(item.id)))
         .map(item => {
@@ -1670,6 +1683,7 @@ const server = http.createServer(async (req, res) => {
             id: String(item.id), title: item.title || '', author: item.author || '', fileBaseName,
             mediaType: item.mediaType === 'image' ? 'image' : 'video',
             playUrl: isDouyinMediaUrl(item.playUrl) ? item.playUrl : '',
+            qualities: Array.isArray(item.qualities) ? item.qualities : [],
             images: Array.isArray(item.images) ? item.images.filter(isDouyinMediaUrl) : [],
             imageMedia: Array.isArray(item.imageMedia) ? item.imageMedia : undefined,
             livePhotoCount: Number(item.livePhotoCount) || 0,
