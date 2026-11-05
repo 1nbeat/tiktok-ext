@@ -92,7 +92,7 @@
       <section id="view-library" class="workspace-view">
         <header class="view-header"><div><span class="view-eyebrow">LIBRARY</span><h1>作品库</h1><p>浏览喜欢、收藏和用户作品</p></div><div class="view-actions"><button id="profile-sync" class="secondary" type="button">加载用户作品</button><button id="sync" class="primary" type="button">同步喜欢与收藏</button></div></header>
       <section class="status" id="sync-status" hidden><div class="status-heading"><div id="status">等待同步。</div><button id="sync-status-close" class="status-close" type="button" hidden>关闭</button></div><div class="progress-track" id="progress-track" hidden><div class="progress-value" id="progress-value"></div></div><div class="progress-detail" id="progress-detail"></div></section>
-      <div class="library-actions"><div><h2>我的作品集</h2><span>作品列表</span></div><button id="download-all" class="secondary" type="button" disabled>批量下载当前列表</button></div>
+      <div class="library-actions"><div><h2>我的作品集</h2><span id="library-state">作品列表</span></div><button id="download-all" class="secondary" type="button" disabled>批量下载当前列表</button></div>
       <!-- 各数据源只在前端切换，避免重复抓取。 -->
       <nav class="tabs" aria-label="内容类型">
         <button class="tab active" data-source="like">

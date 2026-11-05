@@ -52,6 +52,11 @@ test('download files stay inside the download directory', async t => {
   const cookie = login.headers.get('set-cookie').split(';')[0];
   assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
   const auth = { headers: { cookie } };
+  const library = await (await fetch(`${base}/api/library?source=like&page=1`, auth)).json();
+  assert.deepEqual(library.items, []);
+  assert.equal(library.total, 0);
+  assert.equal(library.checkpoint.complete, false);
+  assert.equal((await fetch(`${base}/api/library?source=invalid`, auth)).status, 400);
   const listing = await (await fetch(`${base}/api/download/files`, auth)).json();
   assert.deepEqual(listing.files.map(file => file.path), ['album/test.txt']);
   const file = await fetch(`${base}/api/download/file?path=${encodeURIComponent('album/test.txt')}`, auth);

@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { createLibrary } from '../library.mjs';
+
+test('pages and checkpoints persist atomically and remain isolated by account', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'douyin-library-test-'));
+  const filename = path.join(dir, 'library.sqlite');
+  let library = createLibrary(filename);
+  t.after(async () => { library.close(); await rm(dir, { recursive: true, force: true }); });
+  const work = (id, title, likes, mediaType = 'video') => ({ id, title, author: 'author', likes, mediaType, duration: likes });
+  library.savePage('a', 'like', [work('1', 'One', 1), work('2', 'Two', 10, 'image')], { cursor: '55', pages: 1, complete: false });
+  library.savePage('b', 'like', [work('3', 'Other', 2)], { cursor: '0', pages: 1, complete: true });
+  assert.deepEqual(library.checkpoints('a').like, { cursor: '55', pages: 1, complete: false });
+  assert.deepEqual(library.list('a', 'like', { pageSize: 1, sort: 'likes' }).items.map(item => item.id), ['2']);
+  assert.equal(library.list('a', 'like', { query: 'twO' }).total, 1);
+  assert.equal(library.list('a', 'like').imageCount, 1);
+  assert.equal(library.list('b', 'like').total, 1);
+  assert.throws(() => library.savePage('a', 'like', [work('4', 'Four', 2), { ...work('5', 'Five', 3), bad: 1n }], { cursor: '100', pages: 2, complete: false }));
+  assert.equal(library.list('a', 'like').total, 2);
+  assert.equal(library.checkpoints('a').like.cursor, '55');
+  library.close();
+  library = createLibrary(filename);
+  assert.equal(library.begin('a').like.cursor, '55');
+  library.savePage('a', 'like', [work('2', 'Updated', 5)], { cursor: '55', pages: 2, complete: true });
+  library.savePage('a', 'collect', [], { cursor: '0', pages: 1, complete: true });
+  assert.equal(library.list('a', 'like').items[1].title, 'Updated');
+  assert.equal(library.begin('a').like.pages, 0);
+  assert.equal(library.list('a', 'like').total, 2);
+  library.savePage('a', 'like', [work('2', 'Updated', 5)], { cursor: '0', pages: 1, complete: true });
+  assert.deepEqual(library.list('a', 'like').items.map(item => item.id), ['2']);
+  assert.equal(library.list('b', 'like').total, 1);
+});

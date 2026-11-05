@@ -46,7 +46,7 @@
 
 - Windows 或 Linux
 - Google Chrome 或 Chromium（支持无头模式）
-- Node.js 22 或更高版本
+- Node.js 22.13 或更高版本（使用内置 SQLite）
 - 可以正常登录并访问抖音的账号
 
 项目只使用 Node.js 内置模块，不需要安装第三方 npm 依赖。
@@ -77,7 +77,7 @@
 
 点击账号信息旁的“退出登录”可退出当前抖音账号；退出后已同步的列表会清空。同步或下载正在运行时，请先等待完成或暂停下载。
 
-账号页支持添加多个抖音账号并切换。新增账号会启动独立的无头 Chrome 会话，扫码登录后保存到 `.chrome-accounts/`；原有账号仍使用 `.chrome-debug-profile/`。账号列表及上次选中的账号保存在 `accounts.json`。切换会清空当前作品列表，需要重新同步；暂停的下载任务只能在创建它的账号下继续。
+账号页支持添加多个抖音账号并切换。新增账号会启动独立的无头 Chrome 会话，扫码登录后保存到 `.chrome-accounts/`；原有账号仍使用 `.chrome-debug-profile/`。账号列表及上次选中的账号保存在 `accounts.json`。喜欢和收藏按账号保存在 `library.sqlite`；暂停的下载任务只能在创建它的账号下继续。
 
 如果 9222 端口已有打开抖音个人页的 Chrome，服务会复用它。要确保使用无头模式，关闭已有调试 Chrome 后使用 `npm start`。
 
@@ -86,7 +86,7 @@
 1. 安装 Node.js 22 或更高版本以及 Google Chrome 或 Chromium，确保运行用户有权限执行浏览器并读写项目目录。建议使用普通用户运行，Chrome 需要可用的 Linux sandbox。
 2. 在宝塔的 Node 项目管理器中添加项目，运行目录设为项目根目录，启动命令为 `npm start`，设置 `PORT=9001`；如果浏览器不在常见路径，设置 `CHROME_PATH` 为其绝对路径。
 3. 在宝塔网站中将域名反向代理到 `http://127.0.0.1:9001`，并通过 HTTPS 和宝塔访问认证或私有网络限制访问。不要公开 Node 端口或 Chrome 调试端口。
-4. 访问网站并扫码登录。浏览器会话、`accounts.json`、`download-state.json` 和 `downloads/` 必须保存在可写且持久化的目录中。
+4. 访问网站并扫码登录。浏览器会话、`accounts.json`、`library.sqlite`、`download-state.json` 和 `downloads/` 必须保存在可写且持久化的目录中。
 5. 下载任务完成后，可在“下载任务”的“已下载文件”列表中将服务器文件下载到本机。
 
 Linux 浏览器依赖和抖音登录、同步的兼容性与发行版、服务器环境有关，部署后需要实际验证。
@@ -122,7 +122,7 @@ http://localhost:9001
 3. 等待同步完成，页面会显示喜欢、收藏两个列表及其数量。
 4. 使用顶部搜索、排序、分页和标签切换浏览结果。
 
-程序优先调用抖音列表接口分页获取数据；接口不可用时会回退到页面滚动方式。同步结果保存在当前 Node.js 进程内存中，服务重启后需要重新同步。
+程序优先调用抖音列表接口分页获取数据，每页写入 SQLite 后即可在界面中查看；分页游标与该页数据一起保存。同步中断后可以点击“继续同步”，从最后保存的游标继续。接口不可用时会回退到页面滚动方式，滚动获取的部分作品会保留，但不会标记为完整同步。指定用户作品仍保存在进程内存中。
 
 ### 加载指定用户作品
 
@@ -195,10 +195,11 @@ tiktok-ext/
 ├─ package.json           # 项目元数据和启动命令
 ├─ downloads/             # 下载文件目录，运行时自动创建
 ├─ download-state.json    # 下载任务状态，运行时生成
+├─ library.sqlite         # 各账号的喜欢、收藏和分页进度
 └─ .chrome-debug-profile/ # 独立 Chrome 用户目录，保存登录状态
 ```
 
-其中 `.chrome-debug-profile/`、`downloads/` 和 `download-state.json` 已加入 `.gitignore`，不要将它们提交到代码仓库。
+其中浏览器用户目录、`downloads/`、`library.sqlite` 和下载任务状态已加入 `.gitignore`，不要将它们提交到代码仓库。备份数据库时应同时处理 SQLite 的 WAL 文件，或在服务停止后备份。
 
 ## HTTP API
 
@@ -206,7 +207,7 @@ tiktok-ext/
 | --- | --- | --- |
 | `POST` | `/api/sync/start` | 后台开始同步喜欢和收藏 |
 | `GET` | `/api/sync/status` | 查询喜欢和收藏同步状态及结果 |
-| `GET` | `/api/sync` | 获取最近一次同步结果 |
+| `GET` | `/api/library?source=like&page=1` | 按页获取当前账号的喜欢或收藏，支持搜索和排序 |
 | `POST` | `/api/profile/sync` | 根据用户主页链接开始加载作品 |
 | `GET` | `/api/profile/sync/status` | 查询用户作品加载状态及结果 |
 | `POST` | `/api/download/jobs` | 创建列表或指定作品的后台下载任务 |
@@ -253,6 +254,7 @@ tiktok-ext/
 - `.chrome-debug-profile/` 可能包含 Cookie、登录状态和浏览记录，应保留在本机。
 - `downloads/` 可能包含大量视频和图片，不建议提交到 Git。
 - `download-state.json` 可能包含作品标题、作者和下载路径，也不应提交到 Git。
+- `library.sqlite` 包含账号的喜欢、收藏和同步进度，也不应提交到 Git。
 - `config.json` 包含访问密码，需要限制文件读取权限，并且不要提交到 Git。访问密码不替代 HTTPS。
 - 抖音媒体地址通常有时效性；地址失效时，重新打开作品详情即可获取新地址。
 - 请遵守抖音服务条款、版权要求和适用法律，仅下载你有权保存和使用的内容。

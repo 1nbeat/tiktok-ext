@@ -7,6 +7,7 @@
 !/config.example.json
 /downloads/
 /download-state.json
+/library.sqlite*
 
 # 依赖
 node_modules/

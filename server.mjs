@@ -6,12 +6,14 @@ import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createAccessControl } from './access.mjs';
+import { createLibrary } from './library.mjs';
 
 // 静态页面目录和本地服务端口；服务只在本机提供访问。
 const root = path.resolve('public');
 const port = Number(process.env.PORT || 9001);
 const host = process.env.HOST || '127.0.0.1';
 const access = await createAccessControl(path.resolve(process.env.ACCESS_CONFIG || 'config.json'));
+const library = createLibrary(path.resolve('library.sqlite'));
 const downloadRoot = path.resolve('downloads');
 const downloadStatePath = path.resolve('download-state.json');
 const DOWNLOAD_CONCURRENCY = 2;
@@ -181,7 +183,6 @@ async function connectCdp(url) {
   const ws = new WebSocket(url);
   ws.nextId = 0;
   ws.pending = new Map();
-  ws.events = [];
   ws.addEventListener('message', event => {
     const message = JSON.parse(event.data);
     if (message.id && ws.pending.has(message.id)) {
@@ -189,7 +190,6 @@ async function connectCdp(url) {
       ws.pending.delete(message.id);
       message.error ? pending.reject(new Error(message.error.message)) : pending.resolve(message.result);
     } else if (message.method) {
-      if (message.method === 'Network.responseReceived' && /\/aweme\/v1\/web\/(?:aweme\/(favorite|listcollection)|collects\/video\/list)\//.test(message.params?.response?.url || '') && ws.events.length < 1000) ws.events.push(message);
       ws.onEvent?.(message);
     }
   });
@@ -231,13 +231,13 @@ function imageMediaFromAweme(item, isMediaUrl) {
   return media;
 }
 
-const pageScript = `(async () => {
+const pageScript = checkpoints => `(async () => {
+  const checkpoints = ${JSON.stringify(checkpoints)};
   const imageMediaFromAweme = ${imageMediaFromAweme.toString()};
   const isDouyinMediaUrl = ${isDouyinMediaUrl.toString()};
   // 这段脚本在抖音页面内执行：优先调用列表接口分页，失败时再使用页面滚动兜底。
-  const result = { like: false, collect: false, api: { like: false, collect: false }, order: { like: [], collect: [] }, items: { like: [], collect: [] } };
+  const result = { api: { like: false, collect: false }, order: { like: [], collect: [] } };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const itemIds = { like: new Set(), collect: new Set() };
   const click = text => {
     const el = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && e.textContent.trim() === text);
     if (el) { el.click(); return true; }
@@ -318,18 +318,16 @@ const pageScript = `(async () => {
     };
   };
   const addIds = (phase, items) => {
-    const known = new Set(result.order[phase]);
+    const known = new Set();
+    const batch = [];
     for (const item of items || []) {
       const id = String(item?.aweme_id || item?.group_id || '');
       if (id && !known.has(id)) {
         known.add(id);
-        result.order[phase].push(id);
-      }
-      if (id && !itemIds[phase].has(id)) {
-        itemIds[phase].add(id);
-        result.items[phase].push(compactItem(item, phase));
+        batch.push(compactItem(item, phase));
       }
     }
+    return batch;
   };
   const recordOrder = phase => {
     // 列表可能是虚拟列表，每轮只保留当前可见卡片；按首次出现顺序去重即可还原原页面顺序。
@@ -393,13 +391,26 @@ const pageScript = `(async () => {
       clearTimeout(timeout);
     }
   };
+  const fetchPage = async (url, options) => {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { return await fetchJson(url, options); }
+      catch (error) {
+        lastError = error;
+        if (attempt < 2) await sleep(500 * (attempt + 1));
+      }
+    }
+    throw lastError;
+  };
   const loadByApi = async phase => {
     // 喜欢接口每页最多 50 条；收藏接口按抖音实际限制使用 10 条。
     const pageSize = phase === 'like' ? 50 : 10;
     const maxPages = 220;
     const progressPages = 20;
-    let cursor = 0;
-    const seenCursors = new Set(['0']);
+    const previous = checkpoints[phase] || { cursor: '0', pages: 0, complete: false };
+    if (previous.complete) { result.api[phase] = true; return true; }
+    let cursor = previous.cursor || '0';
+    const seenCursors = new Set([String(cursor)]);
     let reachedEnd = false;
     for (let page = 0; page < maxPages; page += 1) {
       const query = makeDeviceQuery();
@@ -410,43 +421,52 @@ const pageScript = `(async () => {
         query.set('min_cursor', '0');
         query.set('whale_cut_token', '');
         query.set('cut_version', '1');
-        data = await fetchJson('/aweme/v1/web/aweme/favorite/?' + query.toString());
+        data = await fetchPage('/aweme/v1/web/aweme/favorite/?' + query.toString());
       } else {
-        data = await fetchJson('/aweme/v1/web/aweme/listcollection/?' + query.toString(), {
+        data = await fetchPage('/aweme/v1/web/aweme/listcollection/?' + query.toString(), {
           method: 'POST',
           headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8' },
           body: 'count=' + pageSize + '&cursor=' + encodeURIComponent(String(cursor))
         });
       }
       const items = Array.isArray(data.aweme_list) ? data.aweme_list : [];
-      addIds(phase, items);
+      const batch = addIds(phase, items);
+      const more = Boolean(data.has_more);
+      const nextCursor = more ? String(phase === 'like' ? data.max_cursor ?? '' : data.cursor ?? '') : String(cursor);
+      const validCursor = !more || (items.length > 0 && /^\\d+$/.test(nextCursor) && !seenCursors.has(nextCursor));
+      console.log('__DY_SYNC_BATCH__', phase, JSON.stringify(batch), JSON.stringify(validCursor ? { cursor: nextCursor, pages: previous.pages + page + 1, complete: !more } : null));
       // 总页数未知，20 页只用于让进度条持续反馈；完成时服务端会统一置为 100%。
-      console.log('__DY_SYNC_PROGRESS__', phase, page + 1, progressPages, result.order[phase].length);
-      if (!data.has_more) {
+      console.log('__DY_SYNC_PROGRESS__', phase, previous.pages + page + 1, progressPages, result.order[phase].length);
+      if (!more) {
         reachedEnd = true;
         break;
       }
       if (!items.length) throw new Error('接口返回空页，无法确认列表是否完整');
-      const nextCursor = Number(phase === 'like' ? data.max_cursor : data.cursor);
-      if (!Number.isFinite(nextCursor) || seenCursors.has(String(nextCursor))) throw new Error('接口游标异常，无法继续分页');
-      seenCursors.add(String(nextCursor));
+      if (!validCursor) throw new Error('接口游标异常，无法继续分页');
+      seenCursors.add(nextCursor);
       cursor = nextCursor;
       await sleep(40);
     }
     if (!reachedEnd) throw new Error('接口分页超过安全上限');
-    if (!result.order[phase].length && phase === 'like') throw new Error('喜欢接口没有返回数据');
     result.api[phase] = true;
     return true;
   };
-  const resetScroll = () => {
-    // 每个标签从顶部开始，避免上一次同步停留在列表底部。
-    for (const scroller of document.querySelectorAll('*')) {
-      if (scroller.scrollHeight - scroller.clientHeight > 300) scroller.scrollTop = 0;
+  const scrollContainers = () => {
+    const found = [];
+    let el = document.querySelector('[data-e2e="scroll-list"]');
+    while (el) {
+      if (el.scrollHeight - el.clientHeight > 300) found.push(el);
+      el = el.parentElement;
     }
+    const root = document.scrollingElement;
+    if (root && !found.includes(root) && root.scrollHeight - root.clientHeight > 300) found.push(root);
+    return found;
+  };
+  const resetScroll = () => {
+    for (const scroller of scrollContainers()) scroller.scrollTop = 0;
     window.scrollTo(0, 0);
   };
-  const scrollHeight = () => [...document.querySelectorAll('*')]
-    .filter(el => el.scrollHeight - el.clientHeight > 300)
+  const scrollHeight = () => scrollContainers()
     .reduce((max, el) => Math.max(max, el.scrollHeight), 0);
   const waitForListUpdate = async (phase, count, height) => {
     // 网络响应通常不到 1 秒；检测到列表变化后立即进入下一轮，避免固定长等待。
@@ -466,9 +486,7 @@ const pageScript = `(async () => {
     let previousCount = result.order[phase].length;
     const maxPages = 220;
     for (let page = 0; page < maxPages; page += 1) {
-      const scrollers = [...document.querySelectorAll('*')]
-        .filter(el => el.scrollHeight - el.clientHeight > 300)
-        .sort((a, b) => b.scrollHeight - a.scrollHeight);
+      const scrollers = scrollContainers().sort((a, b) => b.scrollHeight - a.scrollHeight);
       const beforeHeight = scrollHeight();
       for (const scroller of scrollers) {
         scroller.scrollTop = scroller.scrollHeight;
@@ -481,28 +499,29 @@ const pageScript = `(async () => {
       if (currentCount === previousCount) stableRounds += 1;
       else stableRounds = 0;
       previousCount = currentCount;
-      console.log('__DY_SYNC_PROGRESS__', phase, page + 1, maxPages, currentCount);
+      console.log('__DY_SYNC_PROGRESS__', phase, page + 1, maxPages, currentCount, 'scroll');
       if (stableRounds >= 5) break;
     }
   };
-  // 先切走再切回，确保页面打开时已经停留在目标标签也会重新触发请求。
-  click('收藏');
-  await sleep(120);
-  result.like = click('喜欢');
-  await sleep(120);
   try { await loadByApi('like'); } catch (error) {
     console.warn('喜欢接口分页失败，回退页面滚动：' + error.message);
+    console.log('__DY_SYNC_FALLBACK__', 'like', String(error.message || error));
+    click('收藏');
+    await sleep(120);
+    click('喜欢');
+    await sleep(120);
     await loadAllVisiblePages('like');
   }
-  result.collect = click('收藏');
-  await sleep(120);
-  click('视频');
-  await sleep(120);
   try { await loadByApi('collect'); } catch (error) {
     console.warn('收藏接口分页失败，回退页面滚动：' + error.message);
+    console.log('__DY_SYNC_FALLBACK__', 'collect', String(error.message || error));
+    click('收藏');
+    await sleep(120);
+    click('视频');
+    await sleep(120);
     await loadAllVisiblePages('collect');
   }
-  return result;
+  return { api: result.api };
 })()`;
 
 // 在已经打开的抖音用户主页中滚动作品列表。作品数据由 CDP Network 事件读取，
@@ -1503,7 +1522,7 @@ function mergeVideoDetail(base, detail) {
   return merged;
 }
 
-async function syncFromChrome(onProgress = () => {}) {
+async function syncFromChrome(accountId, checkpoints, onProgress = () => {}) {
   // 通过 Chrome 调试协议执行页面脚本，同步喜欢和收藏列表。
   // 复用用户当前已登录的抖音页面，服务端不读取或保存 Cookie。
   const tabs = await (await fetch(`${activeCdp}/json/list`, { signal: AbortSignal.timeout(10000) })).json();
@@ -1511,23 +1530,38 @@ async function syncFromChrome(onProgress = () => {}) {
   if (!tab) throw new Error('未找到抖音个人页。请使用带 --remote-debugging-port=9222 的 Chrome 打开页面。');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
   try {
+    let batchError = null;
     // 响应体要在 loadingFinished 后立即读取，Chrome 可能很快回收旧响应。
     ws.responseUrls = new Map();
-    ws.responseBodies = new Map();
     ws.responseBodyPromises = [];
     ws.skipResponseBodies = new Set();
     ws.onEvent = event => {
       if (event.method === 'Runtime.consoleAPICalled') {
         const values = event.params.args.map(arg => arg.value);
+        if (values[0] === '__DY_SYNC_BATCH__' && ['like', 'collect'].includes(values[1]) && !batchError) {
+          try {
+            const batch = JSON.parse(values[2]);
+            if (!Array.isArray(batch)) throw new Error('invalid batch');
+            library.savePage(accountId, values[1], batch, JSON.parse(values[3]));
+            onProgress({ phase: values[1], dataChanged: true });
+          } catch (error) {
+            batchError = new Error(`同步数据保存失败：${error.message}`);
+            try { ws.send(JSON.stringify({ id: ++ws.nextId, method: 'Runtime.terminateExecution' })); } catch {}
+          }
+        }
+        if (values[0] === '__DY_SYNC_FALLBACK__' && ['like', 'collect'].includes(values[1])) {
+          ws.syncActivity?.();
+          onProgress({ phase: values[1], fallbackPhase: values[1], fallbackReason: String(values[2] || '接口不可用'), message: '接口分页失败，正在尝试页面滚动' });
+        }
         if (values[0] === '__DY_SYNC_PROGRESS__') {
           ws.syncActivity?.();
-          const [, phase, current, total, count] = values;
+          const [, phase, current, total] = values;
           const ratio = Math.min(1, Math.max(0, Number(current) / Number(total)));
           onProgress({
             phase,
             progress: Math.round(phase === 'like' ? ratio * 65 : 65 + ratio * 35),
             pages: Number(current) || 0,
-            message: phase === 'like' ? `正在加载喜欢列表（已发现 ${Number(count) || 0} 条）` : `正在加载收藏列表（已发现 ${Number(count) || 0} 条）`
+            message: `正在${values[5] === 'scroll' ? '滚动加载' : '加载'}${phase === 'like' ? '喜欢' : '收藏'}列表（已保存 ${library.list(accountId, phase, { pageSize: 1 }).totalItems} 条）`
           });
         }
       }
@@ -1546,25 +1580,24 @@ async function syncFromChrome(onProgress = () => {}) {
       if (event.method === 'Network.loadingFinished' && ws.responseUrls.has(event.params.requestId) && !ws.skipResponseBodies.has(event.params.requestId)) {
         const requestId = event.params.requestId;
         const bodyPromise = cdpCall(ws, 'Network.getResponseBody', { requestId }).then(body => {
-          try { ws.responseBodies.set(requestId, { url: ws.responseUrls.get(requestId), data: JSON.parse(body.body) }); } catch { /* 忽略格式异常的响应 */ }
+          let data;
+          try { data = JSON.parse(body.body); } catch { return; }
+          const source = /\/aweme\/favorite\//.test(ws.responseUrls.get(requestId)) ? 'like' : 'collect';
+          if (!batchError && Array.isArray(data.aweme_list)) {
+            try { library.savePage(accountId, source, data.aweme_list.map(item => itemFromAweme(item, source)), null); onProgress({ dataChanged: true }); }
+            catch (error) { batchError = new Error(`同步数据保存失败：${error.message}`); }
+          }
         }).catch(() => {});
         ws.responseBodyPromises.push(bodyPromise);
       }
     };
-    await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 100 * 1024 * 1024, maxResourceBufferSize: 5 * 1024 * 1024 });
+    await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 16 * 1024 * 1024, maxResourceBufferSize: 4 * 1024 * 1024 });
     await cdpCall(ws, 'Runtime.enable');
     // 等待页面脚本完成，并取回它记录的 DOM 顺序。
-    const evaluation = await evaluateSyncScript(ws, pageScript);
+    const evaluation = await evaluateSyncScript(ws, pageScript(checkpoints));
+    if (batchError) throw batchError;
     if (evaluation.exceptionDetails) throw new Error(evaluation.exceptionDetails.exception?.description || evaluation.exceptionDetails.text || '同步脚本执行失败');
     const pageResult = evaluation.result?.value || {};
-    const domOrder = pageResult.order || { like: [], collect: [] };
-    if (pageResult.api?.like && pageResult.api?.collect) {
-      return {
-        like: (pageResult.items?.like || []).map(item => ({ ...item, source: 'like' })),
-        collect: (pageResult.items?.collect || []).map(item => ({ ...item, source: 'collect' })),
-        syncedAt: new Date().toISOString()
-      };
-    }
     // 页面脚本已经等待接口返回；只留出短暂时间让最后一个 loadingFinished 事件入队。
     // 通过循环排空当前 Promise，避免固定等待数秒，也避免遗漏并发响应体。
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -1575,60 +1608,8 @@ async function syncFromChrome(onProgress = () => {}) {
         if (pending.length === ws.responseBodyPromises.length) break;
       }
     }
-    const responses = ws.events.filter(e => e.method === 'Network.responseReceived')
-      .filter(e => /\/aweme\/v1\/web\/(?:aweme\/(favorite|listcollection)|collects\/video\/list)\//.test(e.params.response.url));
-    const unique = new Map();
-    // loadingFinished 事件中已经读取成功的响应体无需再次调用 CDP；重复读取大 JSON
-    // 是同步结束阶段最明显的额外耗时来源。
-    for (const [requestId, response] of ws.responseBodies) unique.set(requestId, response);
-    for (const event of responses) {
-      if (ws.skipResponseBodies.has(event.params.requestId)) continue;
-      if (unique.has(event.params.requestId)) continue;
-      try {
-        const body = await cdpCall(ws, 'Network.getResponseBody', { requestId: event.params.requestId });
-        const data = JSON.parse(body.body);
-        unique.set(event.params.requestId, { url: event.params.response.url, data });
-      } catch { /* Chrome 可能已经回收响应体，无法再次读取 */ }
-    }
-    // 同一标签可能同时请求多个接口；统一按 ID 建详情索引，再用 DOM 顺序分配来源。
-    const allItems = new Map();
-    const fallbackItems = { like: new Map(), collect: new Map() };
-    for (const { url, data } of unique.values()) {
-      const source = /\/aweme\/favorite\//.test(url) ? 'like' : 'collect';
-      for (const item of data.aweme_list || []) {
-        const normalized = itemFromAweme(item, source);
-        if (!allItems.has(normalized.id)) allItems.set(normalized.id, normalized);
-        if (!fallbackItems[source].has(normalized.id)) fallbackItems[source].set(normalized.id, normalized);
-      }
-    }
-    // 直接分页脚本会返回压缩后的展示字段，作为响应体被 Chrome 回收时的完整性兜底。
-    for (const source of ['like', 'collect']) {
-      for (const item of pageResult.items?.[source] || []) {
-        if (!item?.id || allItems.has(item.id)) continue;
-        const normalized = { ...item, source };
-        allItems.set(normalized.id, normalized);
-        if (!fallbackItems[source].has(normalized.id)) fallbackItems[source].set(normalized.id, normalized);
-      }
-    }
-    const orderItems = (source, ids) => {
-      const used = new Set();
-      const ordered = [];
-      for (const id of ids) {
-        const item = allItems.get(id);
-        if (item && !used.has(id)) {
-          used.add(id);
-          ordered.push({ ...item, source });
-        }
-      }
-      // 虚拟列表未保留在 DOM 中的条目，按接口返回结果补到末尾。
-      for (const item of fallbackItems[source].values()) if (!used.has(item.id)) ordered.push(item);
-      return ordered;
-    };
-    return {
-      like: orderItems('like', domOrder.like),
-      collect: orderItems('collect', domOrder.collect),
-      syncedAt: new Date().toISOString()
-    };
+    if (batchError) throw batchError;
+    return { complete: Boolean(pageResult.api?.like && pageResult.api?.collect), syncedAt: new Date().toISOString() };
   } finally { ws.close(); }
 }
 
@@ -1752,7 +1733,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
   } finally { ws.close(); }
 }
 
-// 最新一次成功同步的数据只保存在内存中，重启服务后会清空。
+// 指定用户作品暂存在内存；喜欢和收藏保存在 SQLite 中。
 let latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
 let syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
 let userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
@@ -1925,6 +1906,7 @@ async function logoutFromChrome() {
       if (status && ['login', 'confirm_phone', 'verification'].includes(status.status)) {
         const account = accounts.find(item => item.id === activeAccountId);
         if (account) { account.signedOut = true; await saveAccounts(); }
+        library.clear(activeAccountId);
         latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
         syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
         userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
@@ -1961,16 +1943,18 @@ async function switchAccount(id) {
 function startSync() {
   // 防止重复启动同步，并在后台任务完成后更新最新数据缓存。
   if (syncState.running) return;
-  syncState = { running: true, progress: 0, phase: 'like', message: '正在连接抖音页面', likePages: 0, collectPages: 0, error: null };
-  syncFromChrome(update => {
+  const accountId = activeAccountId;
+  const checkpoints = library.begin(accountId);
+  syncState = { running: true, progress: 0, phase: 'like', message: '正在连接抖音页面', likePages: checkpoints.like.pages, collectPages: checkpoints.collect.pages, version: 0, error: null };
+  syncFromChrome(accountId, checkpoints, update => {
+    if (update.dataChanged) { syncState.version++; delete update.dataChanged; }
     if (update.phase && Number.isFinite(update.pages) && update.pages > 0) {
       // 只采用页面脚本报告的分页数，避免页面自身的预加载请求污染进度。
       syncState[`${update.phase}Pages`] = update.pages;
     }
     if (update.phase) Object.assign(syncState, update);
   }).then(data => {
-    latestData = { ...data, user: latestData.user, userProfileUrl: latestData.userProfileUrl };
-    syncState = { ...syncState, running: false, progress: 100, phase: 'done', message: '同步完成' };
+    syncState = { ...syncState, running: false, progress: data.complete ? 100 : syncState.progress, phase: data.complete ? 'done' : 'partial', partial: !data.complete, message: data.complete ? '同步完成' : '已保存部分作品，接口未完整同步，可再次尝试继续', syncedAt: data.syncedAt };
   }).catch(error => {
     syncState = { ...syncState, running: false, message: '同步失败', error: error.message };
   });
@@ -2054,13 +2038,20 @@ const server = http.createServer(async (req, res) => {
     if (requestUrl.pathname === '/api/profile/sync/status' && req.method === 'GET') {
       return send(res, 200, JSON.stringify({ ...userSyncState, data: userSyncState.running ? null : latestData.user, userProfileUrl: latestData.userProfileUrl }));
     }
-    if (req.url === '/api/sync/status') return send(res, 200, JSON.stringify({ ...syncState, data: syncState.phase === 'done' ? latestData : null }));
-    if (req.url === '/api/sync') return send(res, 200, JSON.stringify(latestData));
+    if (req.url === '/api/sync/status') return send(res, 200, JSON.stringify({ ...syncState, checkpoints: library.checkpoints(activeAccountId) }));
+    if (requestUrl.pathname === '/api/library' && req.method === 'GET') {
+      const source = requestUrl.searchParams.get('source');
+      if (!['like', 'collect'].includes(source)) return send(res, 400, JSON.stringify({ error: '无效的作品类型' }));
+      const data = library.list(activeAccountId, source, { page: requestUrl.searchParams.get('page'), pageSize: 24, query: (requestUrl.searchParams.get('query') || '').slice(0, 200), sort: requestUrl.searchParams.get('sort') });
+      const counts = Object.fromEntries(['like', 'collect'].map(name => [name, library.list(activeAccountId, name, { pageSize: 1 }).totalItems]));
+      return send(res, 200, JSON.stringify({ ...data, counts, checkpoint: library.checkpoints(activeAccountId)[source] }));
+    }
+    if (req.url === '/api/sync') return send(res, 410, JSON.stringify({ error: '作品列表已改为分页，请使用 /api/library' }));
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'POST') {
       const body = await readJsonBody(req);
       const source = ['like', 'collect', 'user', 'specified'].includes(body.source) ? body.source : 'like';
       const sourceLabels = { like: '喜欢', collect: '收藏', user: '用户', specified: '指定' };
-      let sourceItems = Array.isArray(latestData[source]) ? latestData[source] : [];
+      let sourceItems = ['like', 'collect'].includes(source) ? library.all(activeAccountId, source) : Array.isArray(latestData[source]) ? latestData[source] : [];
       if (source === 'specified') {
         const id = String(body.id || '');
         if (!/^\d+$/.test(id)) return send(res, 400, JSON.stringify({ error: '缺少有效的作品 ID' }));
@@ -2152,7 +2143,7 @@ const server = http.createServer(async (req, res) => {
       const id = requestUrl.searchParams.get('id') || '';
       if (!/^\d+$/.test(id)) return send(res, 400, JSON.stringify({ error: '缺少有效的作品 ID' }));
       // 同步结果存在时沿用列表中的来源信息；即使服务刚重启，也允许按 ID 实时读取详情。
-      const base = [...latestData.like, ...latestData.collect, ...latestData.user].find(item => item.id === id) || { id, source: 'like' };
+      const base = library.find(activeAccountId, id) || latestData.user.find(item => item.id === id) || { id, source: 'like' };
       // 视频同步结果通常已有播放地址，但性别、地区等作者资料需要详情接口补充。
       const hasVideoMedia = base.mediaType !== 'image'
         && isDouyinMediaUrl(base.playUrl)

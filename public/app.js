@@ -60,12 +60,14 @@ async function changeAccount(id) {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '切换账号失败');
     state.like = []; state.collect = []; state.user = []; state.page = 1;
+    libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
     $('#sync-status').hidden = true;
     $('#account-profile').hidden = true;
     $('#account-empty').hidden = false;
     $('#login-open').hidden = false;
     renderSidebarAccount(null, 'loading');
     render();
+    await loadLibrary();
     await refreshAccounts();
     initialLoginCheck = true;
   } catch (cause) {
@@ -153,6 +155,7 @@ $('#account-logout').addEventListener('click', async () => {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '退出登录失败');
     state.like = []; state.collect = []; state.user = []; state.page = 1;
+    libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
     $('#account-profile').hidden = true;
     renderSidebarAccount(null, 'login');
     $('#account-empty').hidden = false;
@@ -224,6 +227,37 @@ $('#login-refresh').addEventListener('click', async () => {
 });
 // saved 表示保持抖音原页面顺序，其余选项是用户主动选择的排序方式。
 const state = { source: 'like', like: [], collect: [], user: [], query: '', sort: 'saved', page: 1 };
+let libraryRequest = 0;
+let libraryCounts = { like: 0, collect: 0 };
+let libraryStats = { like: null, collect: null };
+let libraryTotal = 0;
+let lastSyncVersion = -1;
+
+async function loadLibrary() {
+  if (!['like', 'collect'].includes(state.source)) return;
+  const source = state.source;
+  const request = ++libraryRequest;
+  const generation = accountGeneration;
+  const params = new URLSearchParams({ source, page: String(state.page), query: state.query, sort: state.sort });
+  try {
+    const response = await fetch(`/api/library?${params}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '加载作品失败');
+    if (request !== libraryRequest || generation !== accountGeneration || source !== state.source) return;
+    state[source] = data.items;
+    state.page = data.page;
+    libraryTotal = data.total;
+    libraryCounts = data.counts;
+    libraryStats[source] = data;
+    render();
+  } catch (error) {
+    if (request === libraryRequest && generation === accountGeneration && source === state.source) {
+      $('#status').textContent = error.message;
+      $('#status').classList.add('error');
+      $('#sync-status').hidden = false;
+    }
+  }
+}
 let modalRequestId = 0;
 let downloadJob = null;
 let downloadPollTimer = null;
@@ -275,6 +309,7 @@ function escapeHtml(value) {
 
 // 先筛选，再按工具栏选择排序；默认 sort 不改变数组顺序。
 function getItems() {
+  if (state.source !== 'user') return state[state.source];
   return state[state.source]
     .filter(item => `${item.title} ${item.author}`.toLowerCase().includes(state.query.toLowerCase()))
     .sort((a, b) => {
@@ -308,9 +343,9 @@ function renderPagination(totalPages) {
 function goToPage(value) {
   const page = Number.parseInt(value, 10);
   if (!Number.isFinite(page)) return false;
-  const totalPages = Math.max(1, Math.ceil(getItems().length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil((state.source === 'user' ? getItems().length : libraryTotal) / PAGE_SIZE));
   state.page = Math.min(totalPages, Math.max(1, page));
-  render();
+  if (state.source === 'user') render(); else loadLibrary();
   window.scrollTo({ top: 0, behavior: 'smooth' });
   return true;
 }
@@ -318,13 +353,15 @@ function goToPage(value) {
 // 根据当前标签、搜索条件和页码刷新卡片区域。
 function render() {
   const items = getItems();
-  const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil((state.source === 'user' ? items.length : libraryTotal) / PAGE_SIZE));
   state.page = Math.min(state.page, totalPages);
-  $('#like-count').textContent = state.like.length;
-  $('#collect-count').textContent = state.collect.length;
+  $('#like-count').textContent = libraryCounts.like;
+  $('#collect-count').textContent = libraryCounts.collect;
   $('#user-count').textContent = state.user.length;
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
-  const workCount = sourceItems.length;
+  const workCount = state.source === 'user' ? sourceItems.length : libraryCounts[state.source];
+  const checkpoint = libraryStats[state.source]?.checkpoint;
+  $('#library-state').textContent = state.source === 'user' ? '用户作品' : workCount && !checkpoint?.complete ? '已保存部分作品，尚未完整同步' : '作品列表';
   $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(downloadJob?.status);
   $('#download-specified').disabled = ['running', 'pending'].includes(downloadJob?.status);
   $('#download-all').textContent = workCount ? `批量下载当前列表（${workCount}）` : '批量下载当前列表';
@@ -334,7 +371,7 @@ function render() {
     renderPagination(0);
     return;
   }
-  const pageItems = items.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
+  const pageItems = state.source === 'user' ? items.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE) : items;
   // 卡片不再保留原页面链接，普通点击统一打开本地详情弹窗。
   grid.innerHTML = pageItems.map(item => `<article class="card" data-id="${escapeHtml(item.id)}" tabindex="0" role="button" aria-label="查看 ${escapeHtml(item.title)}"><div class="thumb"><img loading="lazy" src="${escapeHtml(item.cover)}" alt=""><span class="duration">${escapeHtml(formatMediaLabel(item))}</span></div><div class="content"><div class="title">${escapeHtml(item.title)}</div><div class="author">@${escapeHtml(item.author)}</div><div class="meta"><span>赞 ${formatCount(item.likes)}</span><span>评 ${formatCount(item.comments)}</span></div></div></article>`).join('');
   renderPagination(totalPages);
@@ -374,7 +411,8 @@ function renderDownloadJob(job) {
   // 根据后台任务快照刷新总进度、并发状态和当前下载明细。
   downloadJob = job;
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
-  $('#download-all').disabled = sourceItems.length === 0 || ['running', 'pending'].includes(job?.status);
+  const workCount = state.source === 'user' ? sourceItems.length : libraryCounts[state.source];
+  $('#download-all').disabled = workCount === 0 || ['running', 'pending'].includes(job?.status);
   $('#download-specified').disabled = ['running', 'pending'].includes(job?.status);
   const panel = $('#download-status');
   panel.hidden = !job || isDismissedDownloadJob(job);
@@ -426,11 +464,12 @@ async function createDownloadJob({ detail } = {}) {
   // 列表和指定作品共用下载设置、后台任务和进度面板。
   const source = detail ? 'specified' : ['like', 'collect', 'user'].includes(state.source) ? state.source : 'like';
   const works = detail ? [detail] : Array.isArray(state[source]) ? state[source] : [];
-  if (!works.length) return;
+  const stats = !detail && ['like', 'collect'].includes(source) ? libraryStats[source] : null;
+  if (!works.length && !stats?.totalItems) return;
   const initialQuality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const initialConcurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
   const initialAlbumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
-  const confirmed = await requestDownloadConfirmation(source, works, initialQuality, initialConcurrency, initialAlbumMode);
+  const confirmed = await requestDownloadConfirmation(source, works, initialQuality, initialConcurrency, initialAlbumMode, stats);
   if (!confirmed) return;
   const quality = $('#download-quality').value === 'standard' ? 'standard' : 'highest';
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
@@ -445,11 +484,11 @@ async function createDownloadJob({ detail } = {}) {
   pollDownloadJob(job.id);
 }
 
-function requestDownloadConfirmation(source, works, quality, concurrency, albumMode) {
+function requestDownloadConfirmation(source, works, quality, concurrency, albumMode, stats = null) {
   // 打开自定义确认弹窗，并等待用户明确选择开始或取消。
   const modal = $('#download-confirm-modal');
-  const videoCount = works.filter(item => item.mediaType !== 'image').length;
-  const imageCount = works.filter(item => item.mediaType === 'image').length;
+  const videoCount = stats ? stats.videoCount : works.filter(item => item.mediaType !== 'image').length;
+  const imageCount = stats ? stats.imageCount : works.filter(item => item.mediaType === 'image').length;
   const sourceLabel = source === 'specified' ? '指定作品' : source === 'user' ? '用户作品' : source === 'collect' ? '收藏作品' : '喜欢的作品';
   $('#download-confirm-title').textContent = `准备下载${sourceLabel}`;
   $('#download-quality').value = quality;
@@ -503,7 +542,7 @@ async function downloadJobAction(action) {
 }
 
 // 搜索、切换标签或同步完成后回到第一页。
-function resetPageAndRender() { state.page = 1; render(); }
+function resetPageAndRender() { state.page = 1; if (state.source === 'user') render(); else loadLibrary(); }
 
 // 统一生成本地媒体地址；下载参数由服务端转成附件响应。
 function buildStreamUrl(url, { download = false, id = '', index } = {}) {
@@ -979,20 +1018,29 @@ $('#modal-download').addEventListener('click', () => {
 
 // 轮询同步任务状态，直到服务端报告完成或失败。
 async function pollSync() {
-  const response = await fetch('/api/sync/status');
-  const sync = await response.json();
-  $('#status').textContent = sync.error || sync.message;
-  $('#progress-value').style.width = `${sync.progress || 0}%`;
-  $('#progress-detail').textContent = sync.running ? `${sync.progress || 0}% · 喜欢接口 ${sync.likePages} 页 · 收藏接口 ${sync.collectPages} 页` : '';
-  $('#sync-status-close').hidden = sync.running;
-  if (sync.running) return setTimeout(pollSync, 500);
-  $('#sync').disabled = false;
-  if (sync.error) { $('#status').classList.add('error'); return; }
-  if (sync.data) {
-    state.like = sync.data.like || [];
-    state.collect = sync.data.collect || [];
-    $('#status').textContent = `同步完成：喜欢 ${state.like.length} 条，收藏 ${state.collect.length} 条（${new Date(sync.data.syncedAt).toLocaleString()}）`;
-    resetPageAndRender();
+  try {
+    const response = await fetch('/api/sync/status');
+    const sync = await response.json();
+    if (!response.ok) throw new Error(sync.error || '获取同步状态失败');
+    $('#status').textContent = sync.error || sync.message;
+    $('#progress-value').style.width = `${sync.progress || 0}%`;
+    $('#progress-detail').textContent = sync.running ? `${sync.progress || 0}% · 喜欢 ${sync.likePages} 页 · 收藏 ${sync.collectPages} 页${sync.fallbackPhase === sync.phase && sync.fallbackReason ? ` · 接口失败：${sync.fallbackReason}` : ''}` : '';
+    $('#sync-status-close').hidden = sync.running;
+    const checkpoints = Object.values(sync.checkpoints || {});
+    const resumable = checkpoints.some(item => item.pages > 0) && checkpoints.some(item => !item.complete);
+    $('#sync').textContent = resumable ? '继续同步' : '同步喜欢与收藏';
+    if ((sync.version ?? -1) !== lastSyncVersion || !sync.running) {
+      lastSyncVersion = sync.version ?? -1;
+      await loadLibrary();
+    }
+    if (sync.running) return setTimeout(pollSync, 1000);
+    $('#sync').disabled = false;
+    if (sync.error) $('#status').classList.add('error');
+  } catch (error) {
+    $('#sync').disabled = false;
+    $('#status').textContent = error.message;
+    $('#status').classList.add('error');
+    $('#sync-status-close').hidden = false;
   }
 }
 
@@ -1079,7 +1127,7 @@ document.addEventListener('keydown', event => {
   updateImageGallery(selectedDetail?.title || $('#modal-title').textContent);
 });
 
-// 喜欢/收藏标签切换只改变本地视图，不会重新请求抖音。
+// 切换标签时读取本地数据库，不会重新请求抖音。
 $('.tabs').addEventListener('click', event => {
   const tab = event.target.closest('.tab');
   if (!tab) return;
@@ -1087,7 +1135,7 @@ $('.tabs').addEventListener('click', event => {
   document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab));
   resetPageAndRender();
 });
-// 搜索和排序只作用于当前标签的数据。
+// 搜索和排序作用于当前数据源。
 $('#search').addEventListener('input', event => { state.query = event.target.value; resetPageAndRender(); });
 $('#sort').addEventListener('change', event => { state.sort = event.target.value; resetPageAndRender(); });
 // 指定作品解析完成后，使用与批量下载相同的确认弹窗和服务端任务。
@@ -1180,8 +1228,10 @@ $('#sync').addEventListener('click', async () => {
   $('#progress-detail').textContent = '';
   $('#status').classList.remove('error');
   $('#sync-status-close').hidden = true;
+  lastSyncVersion = -1;
   try {
-    await fetch('/api/sync/start', { method: 'POST' });
+    const response = await fetch('/api/sync/start', { method: 'POST' });
+    if (!response.ok) throw new Error((await response.json()).error || '启动同步失败');
     pollSync();
   } catch (error) {
     $('#status').textContent = error.message;
@@ -1241,12 +1291,14 @@ $('#download-status-close').addEventListener('click', () => {
 async function restoreLatest() {
   try {
     const sync = await (await fetch('/api/sync/status')).json();
-    if (sync.data) {
-      state.like = sync.data.like || [];
-      state.collect = sync.data.collect || [];
-      state.user = sync.data.user || [];
-      $('#status').textContent = `最近同步：喜欢 ${state.like.length} 条，收藏 ${state.collect.length} 条（${new Date(sync.data.syncedAt).toLocaleString()}）`;
-      render();
+    await loadLibrary();
+    if (sync.running) {
+      $('#sync').disabled = true;
+      $('#sync-status').hidden = false;
+      $('#progress-track').hidden = false;
+      pollSync();
+    } else if (Object.values(sync.checkpoints || {}).some(item => item.pages > 0) && Object.values(sync.checkpoints || {}).some(item => !item.complete)) {
+      $('#sync').textContent = '继续同步';
     }
     const profileSync = await (await fetch('/api/profile/sync/status')).json();
     if (Array.isArray(profileSync.data) && profileSync.data.length) {
