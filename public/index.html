@@ -19,6 +19,7 @@
         <div class="topbar-actions">
           <div class="topbar-buttons">
             <div class="topbar-data-actions">
+              <button id="login-open" class="secondary" type="button">抖音登录</button>
               <button id="profile-sync" class="secondary" type="button">加载用户作品</button>
               <button id="sync" class="primary">同步喜欢与收藏</button>
             </div>
@@ -30,11 +31,25 @@
           </div>
         </div>
       </header>
+      <section id="account-profile" class="account-profile" aria-label="当前抖音账号" hidden>
+        <img id="account-avatar" class="account-avatar" alt="" width="48" height="48" hidden />
+        <div class="account-details">
+          <strong id="account-name"></strong>
+          <p id="account-signature"></p>
+        </div>
+        <dl class="account-stats">
+          <div><dt>关注</dt><dd id="account-following">--</dd></div>
+          <div><dt>粉丝</dt><dd id="account-followers">--</dd></div>
+          <div><dt>获赞</dt><dd id="account-likes">--</dd></div>
+        </dl>
+        <button id="account-logout" class="secondary" type="button">退出登录</button>
+        <p id="account-logout-error" class="account-logout-error" role="alert" hidden></p>
+      </section>
       <!-- 同步开始后才展示状态和动态进度，避免首页默认占用一块空白区域。 -->
       <section class="status" id="sync-status" hidden>
         <div class="status-heading">
           <div id="status">
-            等待同步。请先在 Chrome 中打开抖音个人页。
+            等待同步。
           </div>
           <button id="sync-status-close" class="status-close" type="button" hidden>
             关闭
@@ -220,6 +235,18 @@
           <button id="download-confirm-start" class="primary" type="button">
             开始下载
           </button>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="login-modal" class="download-confirm-modal login-modal" aria-labelledby="login-title">
+      <button id="login-close" class="modal-close" type="button" aria-label="关闭登录窗口">×</button>
+      <div class="download-confirm-content">
+        <h2 id="login-title">抖音登录</h2>
+        <p id="login-status" role="status">正在检查登录状态</p>
+        <img id="login-qr" alt="抖音登录二维码" width="200" height="200" hidden />
+        <img id="login-verification" alt="抖音身份验证页面，点击选择验证方式" hidden />
+        <div class="download-confirm-actions">
+          <button id="login-refresh" type="button">刷新二维码</button>
         </div>
       </div>
     </dialog>

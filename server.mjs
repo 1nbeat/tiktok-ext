@@ -1609,6 +1609,134 @@ let latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileU
 let syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
 let userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
 
+async function loginPageStatus(refresh = false) {
+  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
+  if (!tab) throw new Error('未找到抖音个人页，请检查无头 Chrome 是否已启动');
+  const ws = await connectCdp(tab.webSocketDebuggerUrl);
+  try {
+    if (refresh) {
+      await cdpCall(ws, 'Page.reload');
+      return { status: 'loading' };
+    }
+    const result = await cdpCall(ws, 'Runtime.evaluate', {
+      expression: `(() => {
+        const text = document.body?.innerText || '';
+        const verification = document.querySelector('#uc-second-verify article');
+        if (verification && verification.getClientRects().length) {
+          const r = verification.getBoundingClientRect();
+          return { status: 'verification', rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+        }
+        const qr = [...document.querySelectorAll('#douyin_login_comp_scan_code_qrcode img')].find(el => el.getClientRects().length);
+        const src = qr?.getAttribute('src') || '';
+        const qrCode = /^data:image\\/png;base64,/.test(src) ? src : '';
+        if (!qr) {
+          const otherAccount = [...document.querySelectorAll('p, button, a')].find(el =>
+            el.getClientRects().length && el.textContent.trim() === '登录其他账号');
+          if (otherAccount) {
+            otherAccount.click();
+            return { status: 'login', qrCode: '', expired: false };
+          }
+        }
+        if (qr || text.includes('未登录') || text.includes('扫码登录')) {
+          return { status: 'login', qrCode, expired: /二维码.{0,8}(过期|失效)|点击刷新/.test(text) };
+        }
+        if (text.includes('获赞') && text.includes('作品') && text.includes('喜欢')) {
+          const user = window.userInfoStore?.curLoginUserInfo;
+          const profile = user?.nickname ? {
+            nickname: String(user.nickname), signature: String(user.desc || ''),
+            avatar: String(user.avatar300Url || user.avatarUrl || ''),
+            following: user.followingCount, followers: user.followerCount,
+            likes: user.totalFavorited
+          } : null;
+          return { status: 'logged_in', profile };
+        }
+        return { status: 'loading' };
+      })()`,
+      returnByValue: true
+    });
+    if (result.exceptionDetails) throw new Error('无法读取抖音登录状态');
+    const status = result.result?.value || { status: 'loading' };
+    if (status.profile?.avatar) {
+      const avatar = status.profile.avatar;
+      if (isDouyinMediaUrl(avatar)) {
+        mediaUrls.set(avatar, Date.now() + 15 * 60 * 1000);
+        status.profile.avatar = `/api/video/stream?kind=image&url=${encodeURIComponent(avatar)}`;
+      } else status.profile.avatar = '';
+    }
+    if (status.status === 'verification') {
+      const clip = { ...status.rect, scale: 1 };
+      const screenshot = await cdpCall(ws, 'Page.captureScreenshot', { format: 'png', clip });
+      return { status: 'verification', image: `data:image/png;base64,${screenshot.data}` };
+    }
+    if (status.status === 'login' && !status.qrCode) {
+      const pending = await cdpCall(ws, 'Runtime.evaluate', { expression: "document.body?.innerText.includes('需在手机上进行确认')", returnByValue: true });
+      if (pending.result?.value) status.status = 'confirm_phone';
+    }
+    return status;
+  } finally { ws.close(); }
+}
+
+async function clickLoginVerification(x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) throw new Error('无效的验证操作');
+  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
+  if (!tab) throw new Error('未找到抖音个人页');
+  const ws = await connectCdp(tab.webSocketDebuggerUrl);
+  try {
+    const result = await cdpCall(ws, 'Runtime.evaluate', {
+      expression: `(() => { const el = document.querySelector('#uc-second-verify article'); if (!el || !el.getClientRects().length) return null; const r = el.getBoundingClientRect(); const x = r.x + r.width * ${x}, y = r.y + r.height * ${y}; return document.elementFromPoint(x, y)?.closest('#uc-second-verify') ? { x, y } : null; })()`,
+      returnByValue: true
+    });
+    const point = result.result?.value;
+    if (!point) throw new Error('验证页面已变化，请重试');
+    await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
+    await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
+  } finally { ws.close(); }
+}
+
+async function logoutFromChrome() {
+  if (syncState.running || userSyncState.running || [...downloadJobs.values()].some(job => job.status === 'running')) {
+    throw new Error('请先等待同步或下载完成，或暂停下载后再退出');
+  }
+  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
+  if (!tab) throw new Error('未找到抖音个人页');
+  const ws = await connectCdp(tab.webSocketDebuggerUrl);
+  try {
+    const result = await cdpCall(ws, 'Runtime.evaluate', {
+      expression: `(() => {
+        const label = [...document.querySelectorAll('p, button, a')].find(el => el.textContent.trim() === '退出登录' && el.children.length === 0);
+        if (!label) return false;
+        (label.closest('button, a') || label.parentElement).click();
+        return true;
+      })()`,
+      returnByValue: true
+    });
+    if (!result.result?.value) throw new Error('未找到抖音退出登录入口，请稍后重试');
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      try {
+        await cdpCall(ws, 'Runtime.evaluate', {
+          expression: `(() => {
+            const dialogs = [...document.querySelectorAll('[role="dialog"], dialog')].filter(el => el.getClientRects().length && /退出登录/.test(el.innerText));
+            const button = dialogs.flatMap(el => [...el.querySelectorAll('button')]).find(el => /^(确认退出|确认|退出登录)$/.test(el.innerText.trim()));
+            button?.click();
+          })()`
+        });
+      } catch { /* 导航期间执行上下文可能暂时不可用。 */ }
+      const status = await loginPageStatus().catch(() => null);
+      if (status && ['login', 'confirm_phone', 'verification'].includes(status.status)) {
+        latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
+        syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
+        userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
+        return;
+      }
+    }
+    throw new Error('未能确认退出登录，请重试');
+  } finally { ws.close(); }
+}
+
 // 后台启动同步，避免 HTTP 请求一直等待页面滚动完成。
 function startSync() {
   // 防止重复启动同步，并在后台任务完成后更新最新数据缓存。
@@ -1646,6 +1774,22 @@ const server = http.createServer(async (req, res) => {
   try {
     // 启动和查询同步状态的 API；静态文件请求在下面统一处理。
     const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (requestUrl.pathname === '/api/login/status' && req.method === 'GET') {
+      return send(res, 200, JSON.stringify(await loginPageStatus()));
+    }
+    if (requestUrl.pathname === '/api/login/logout' && req.method === 'POST') {
+      await logoutFromChrome();
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
+    if (requestUrl.pathname === '/api/login/refresh' && req.method === 'POST') {
+      await loginPageStatus(true);
+      return send(res, 202, JSON.stringify({ status: 'loading' }));
+    }
+    if (requestUrl.pathname === '/api/login/verification/click' && req.method === 'POST') {
+      const { x, y } = await readJsonBody(req);
+      await clickLoginVerification(x, y);
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
     if (req.url === '/api/sync/start' && req.method === 'POST') {
       startSync();
       return send(res, 202, JSON.stringify(syncState));

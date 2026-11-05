@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-rem Run this file to start the debug Chrome session, Node server, and local page.
+rem Start a headless Chrome session, Node server, and local page.
 cd /d "%~dp0"
 
 set "CHROME="
@@ -25,9 +25,9 @@ if errorlevel 1 (
 rem Reuse an already-running debug endpoint when possible; otherwise launch one.
 curl.exe --silent --fail http://127.0.0.1:9222/json/version >nul 2>&1
 if errorlevel 1 (
-  start "Douyin Chrome" "%CHROME%" --remote-debugging-port=9222 --user-data-dir="%~dp0.chrome-debug-profile" --no-first-run --no-default-browser-check "https://www.douyin.com/user/self"
+  start "Douyin Chrome" /b "%CHROME%" --headless=new --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="%~dp0.chrome-debug-profile" --no-first-run --no-default-browser-check "https://www.douyin.com/user/self"
 ) else (
-  start "Douyin Chrome" "%CHROME%" "https://www.douyin.com/user/self"
+  echo Reusing Chrome on port 9222. Close it first to switch to headless mode.
 )
 
 start "Douyin Node Server" cmd /k npm start

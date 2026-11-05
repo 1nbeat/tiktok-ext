@@ -58,19 +58,25 @@
 双击项目目录中的 `start.bat`。脚本会依次完成：
 
 1. 检查 Chrome 和 Node.js 是否可用。
-2. 检查本机 `9222` 调试端口；端口不可用时启动独立 Chrome 用户目录。
-3. 打开抖音个人页 `https://www.douyin.com/user/self`。
+2. 检查本机 `9222` 调试端口；没有浏览器运行时启动使用独立用户目录的无头 Chrome。
+3. 在后台打开抖音个人页 `https://www.douyin.com/user/self`。
 4. 启动 Node.js 本地服务。
 5. 打开 `http://localhost:5173`。
 
-首次使用时，在新打开的 Chrome 窗口中完成抖音登录。登录状态会保存在项目目录的 `.chrome-debug-profile/`，之后再次运行 `start.bat` 会继续使用该状态。
+首次使用时，在项目页面点击“抖音登录”，使用抖音 App 扫描二维码。登录状态会保存在项目目录的 `.chrome-debug-profile/`，之后再次运行 `start.bat` 会继续使用该状态。二维码失效时可点击“刷新二维码”。
+
+登录成功后，登录窗口会自动关闭，页面会显示当前账号的头像、昵称、签名和关注、粉丝、获赞数量。抖音要求身份验证时，可以在登录窗口选择验证方式并按提示操作。
+
+点击账号信息旁的“退出登录”可退出当前抖音账号；退出后已同步的列表会清空。同步或下载正在运行时，请先等待完成或暂停下载。
+
+如果 9222 端口已有 Chrome，启动脚本会复用它；要切换到无头模式，请先关闭原来的调试 Chrome，再运行脚本。项目页面仍会在默认浏览器中打开。
 
 ### 手动方式
 
 如果不使用 `start.bat`，先用调试端口启动 Chrome。Windows 示例：
 
 ```bat
-chrome.exe --remote-debugging-port=9222 --user-data-dir="D:\code\tiktok-ext\.chrome-debug-profile" "https://www.douyin.com/user/self"
+chrome.exe --headless=new --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="D:\code\tiktok-ext\.chrome-debug-profile" "https://www.douyin.com/user/self"
 ```
 
 然后在项目目录执行：
@@ -91,7 +97,7 @@ http://localhost:5173
 
 ### 同步喜欢和收藏
 
-1. 确认带 `9222` 调试端口的 Chrome 已经登录抖音，并打开个人页。
+1. 点击“抖音登录”，确认已经登录抖音。
 2. 打开本地页面，点击“同步喜欢与收藏”。
 3. 等待同步完成，页面会显示喜欢、收藏两个列表及其数量。
 4. 使用顶部搜索、排序、分页和标签切换浏览结果。

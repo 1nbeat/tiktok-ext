@@ -1,8 +1,113 @@
 // 每页展示固定数量，避免内容过多时一次性渲染造成卡顿。
 const PAGE_SIZE = 24;
+const $ = selector => document.querySelector(selector);
+
+let loginPollTimer;
+let loginPolling = false;
+let initialLoginCheck = true;
+let loggingOut = false;
+async function pollLogin() {
+  if (loginPolling || loggingOut) return;
+  clearTimeout(loginPollTimer);
+  loginPolling = true;
+  let nextDelay = 30000;
+  try {
+    const response = await fetch('/api/login/status');
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法检查登录状态');
+    if (loggingOut) return;
+    if (initialLoginCheck && ['login', 'verification', 'confirm_phone'].includes(result.status) && !$('#login-modal').open) $('#login-modal').showModal();
+    if (result.status !== 'loading') initialLoginCheck = false;
+    if (result.status === 'loading' || (result.status === 'logged_in' && !result.profile)) nextDelay = 2000;
+    const profile = result.status === 'logged_in' ? result.profile : null;
+    $('#account-profile').hidden = !profile;
+    $('#login-open').hidden = result.status === 'logged_in';
+    if (profile) {
+      $('#account-name').textContent = profile.nickname;
+      $('#account-signature').textContent = profile.signature || '暂无签名';
+      for (const [id, value] of [['account-following', profile.following], ['account-followers', profile.followers], ['account-likes', profile.likes]]) {
+        $(`#${id}`).textContent = value == null ? '--' : formatCount(Number(value));
+      }
+      const avatar = $('#account-avatar');
+      avatar.hidden = !profile.avatar;
+      if (profile.avatar && avatar.getAttribute('src') !== profile.avatar) avatar.src = profile.avatar;
+    }
+    const qr = $('#login-qr');
+    qr.hidden = !result.qrCode || result.expired;
+    if (result.qrCode) qr.src = result.qrCode;
+    const verification = $('#login-verification');
+    verification.hidden = result.status !== 'verification';
+    if (result.image) verification.src = result.image;
+    $('#login-status').textContent = result.status === 'logged_in' ? '已登录' : result.status === 'verification' ? '抖音需要身份验证，请在下方选择验证方式' : result.status === 'confirm_phone' ? '已扫码，请在手机上确认登录' : result.expired ? '二维码已过期，请刷新' : result.qrCode ? '请使用抖音 App 扫码登录' : '正在加载登录页面';
+    $('#login-open').textContent = result.status === 'logged_in' ? '抖音已登录' : '抖音登录';
+    if (result.status === 'logged_in' && $('#login-modal').open) $('#login-modal').close();
+  } catch (error) {
+    $('#login-status').textContent = error.message;
+    $('#login-qr').hidden = true;
+    $('#login-verification').hidden = true;
+  } finally {
+    loginPolling = false;
+    loginPollTimer = setTimeout(pollLogin, $('#login-modal').open ? 2000 : nextDelay);
+  }
+}
+
+$('#login-open').addEventListener('click', () => { $('#login-modal').showModal(); pollLogin(); });
+$('#account-logout').addEventListener('click', async () => {
+  if (loggingOut) return;
+  loggingOut = true;
+  clearTimeout(loginPollTimer);
+  const button = $('#account-logout');
+  const error = $('#account-logout-error');
+  button.disabled = true;
+  button.textContent = '正在退出';
+  error.hidden = true;
+  try {
+    const response = await fetch('/api/login/logout', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '退出登录失败');
+    state.like = []; state.collect = []; state.user = []; state.page = 1;
+    $('#account-profile').hidden = true;
+    $('#login-open').hidden = false;
+    $('#sync-status').hidden = true;
+    render();
+  } catch (cause) {
+    error.textContent = cause.message;
+    error.hidden = false;
+  } finally {
+    loggingOut = false;
+    button.disabled = false;
+    button.textContent = '退出登录';
+    clearTimeout(loginPollTimer);
+    loginPollTimer = setTimeout(pollLogin, 500);
+  }
+});
+$('#login-close').addEventListener('click', () => $('#login-modal').close());
+$('#login-verification').addEventListener('click', async event => {
+  const rect = event.currentTarget.getBoundingClientRect();
+  try {
+    const response = await fetch('/api/login/verification/click', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height }) });
+    if (!response.ok) throw new Error((await response.json()).error || '验证操作失败');
+    clearTimeout(loginPollTimer);
+    loginPollTimer = setTimeout(pollLogin, 500);
+  } catch (error) { $('#login-status').textContent = error.message; }
+});
+$('#login-modal').addEventListener('close', () => {
+  clearTimeout(loginPollTimer);
+  if (!loginPolling) loginPollTimer = setTimeout(pollLogin, 30000);
+});
+$('#login-refresh').addEventListener('click', async () => {
+  clearTimeout(loginPollTimer);
+  $('#login-qr').hidden = true;
+  $('#login-verification').hidden = true;
+  $('#login-status').textContent = '正在刷新登录页面';
+  try {
+    const response = await fetch('/api/login/refresh', { method: 'POST' });
+    if (!response.ok) throw new Error((await response.json()).error || '刷新失败');
+  } catch (error) { $('#login-status').textContent = error.message; }
+  loginPollTimer = setTimeout(pollLogin, 1500);
+});
 // saved 表示保持抖音原页面顺序，其余选项是用户主动选择的排序方式。
 const state = { source: 'like', like: [], collect: [], user: [], query: '', sort: 'saved', page: 1 };
-const $ = selector => document.querySelector(selector);
 let modalRequestId = 0;
 let downloadJob = null;
 let downloadPollTimer = null;
@@ -1029,3 +1134,4 @@ async function restoreLatest() {
 }
 render();
 restoreLatest();
+pollLogin();
