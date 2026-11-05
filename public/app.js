@@ -29,6 +29,22 @@ function renderSidebarAccount(profile, status) {
   $('#sidebar-account').classList.toggle('is-logged-in', status === 'logged_in');
 }
 
+function renderAccountProfile(profile, status) {
+  renderSidebarAccount(profile, status);
+  $('#account-profile').hidden = !profile;
+  $('#account-empty').hidden = status === 'logged_in';
+  $('#login-open').hidden = status === 'logged_in';
+  if (!profile) return;
+  $('#account-name').textContent = profile.nickname;
+  $('#account-signature').textContent = profile.signature || '暂无签名';
+  for (const [id, value] of [['account-following', profile.following], ['account-followers', profile.followers], ['account-likes', profile.likes]]) {
+    $(`#${id}`).textContent = value == null ? '--' : formatCount(Number(value));
+  }
+  const avatar = $('#account-avatar');
+  avatar.hidden = !profile.avatar;
+  if (profile.avatar && avatar.getAttribute('src') !== profile.avatar) avatar.src = profile.avatar;
+}
+
 let loginPollTimer;
 let loginPolling = false;
 let initialLoginCheck = true;
@@ -37,12 +53,30 @@ let loginLoadingSince = 0;
 let switchingAccount = false;
 let currentAccountId = '';
 let accountGeneration = 0;
+let addingAccount = false;
+let pendingReady = false;
+let pendingLoginTimer;
+let pendingLoginRequest = null;
 async function refreshAccounts() {
   const response = await fetch('/api/accounts');
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || '无法加载账号');
   currentAccountId = data.activeAccountId;
-  $('#account-list').innerHTML = data.accounts.map(account => `<div class="account-row"><span class="account-row-avatar">${account.avatar ? `<img src="${escapeHtml(account.avatar)}" alt="">` : '人'}</span><span class="account-row-name">${escapeHtml(account.name || '未登录账号')}${account.signedOut ? '（已退出）' : ''}</span>${account.id === data.activeAccountId ? '<span class="account-current">当前账号</span>' : `<button type="button" class="secondary account-switch" data-account-id="${escapeHtml(account.id)}">切换</button>`}</div>`).join('');
+  $('#account-list').innerHTML = data.accounts.map(account => `<div class="account-row"><span class="account-row-avatar">${account.avatar ? `<img src="${escapeHtml(account.avatar)}" alt="">` : '人'}</span><span class="account-row-name">${escapeHtml(account.name || '未登录账号')}${account.signedOut ? '（已退出）' : ''}</span>${account.id === data.activeAccountId ? '<span class="account-current">当前账号</span>' : `<button type="button" class="secondary account-switch" data-account-id="${escapeHtml(account.id)}">切换</button>`}<button type="button" class="secondary account-delete" data-delete-account="${escapeHtml(account.id)}" aria-label="删除 ${escapeHtml(account.name || '账号')}">删除</button></div>`).join('');
+}
+
+async function resetAccountView() {
+  state.like = []; state.collect = []; state.user = []; state.page = 1;
+  libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
+  $('#sync-status').hidden = true;
+  $('#account-profile').hidden = true;
+  $('#account-empty').hidden = false;
+  $('#login-open').hidden = false;
+  renderSidebarAccount(null, 'loading');
+  render();
+  await loadLibrary();
+  await refreshAccounts();
+  initialLoginCheck = true;
 }
 
 async function changeAccount(id) {
@@ -56,20 +90,10 @@ async function changeAccount(id) {
   $('#account-add').disabled = true;
   document.querySelectorAll('.account-switch').forEach(button => { button.disabled = true; });
   try {
-    const response = await fetch(id ? '/api/accounts/switch' : '/api/accounts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(id ? { id } : {}) });
+    const response = await fetch('/api/accounts/switch', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '切换账号失败');
-    state.like = []; state.collect = []; state.user = []; state.page = 1;
-    libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
-    $('#sync-status').hidden = true;
-    $('#account-profile').hidden = true;
-    $('#account-empty').hidden = false;
-    $('#login-open').hidden = false;
-    renderSidebarAccount(null, 'loading');
-    render();
-    await loadLibrary();
-    await refreshAccounts();
-    initialLoginCheck = true;
+    await resetAccountView();
   } catch (cause) {
     error.textContent = cause.message;
     error.hidden = false;
@@ -82,13 +106,103 @@ async function changeAccount(id) {
     loginPollTimer = setTimeout(pollLogin, 500);
   }
 }
-$('#account-add').addEventListener('click', () => changeAccount());
+$('#account-add').addEventListener('click', async () => {
+  if (switchingAccount || loggingOut || addingAccount) return;
+  addingAccount = true;
+  accountGeneration++;
+  clearTimeout(loginPollTimer);
+  $('#account-add').disabled = true;
+  $('#account-list-error').hidden = true;
+  $('#login-status').textContent = '正在准备登录';
+  $('#login-qr').hidden = true;
+  $('#login-verification').hidden = true;
+  $('#login-modal').showModal();
+  try {
+    const response = await fetch('/api/accounts', { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法添加账号');
+    pendingReady = true;
+    if (!$('#login-modal').open) { await finishPendingLogin(); return; }
+    pollPendingLogin();
+  } catch (error) {
+    addingAccount = false;
+    $('#account-add').disabled = false;
+    $('#login-modal').close();
+    $('#account-list-error').textContent = error.message;
+    $('#account-list-error').hidden = false;
+    loginPollTimer = setTimeout(pollLogin, 500);
+  }
+});
 $('#account-list').addEventListener('click', event => {
   const button = event.target.closest('[data-account-id]');
   if (button) changeAccount(button.dataset.accountId);
+  const remove = event.target.closest('[data-delete-account]');
+  if (remove) deleteAccount(remove.dataset.deleteAccount);
 });
+
+async function deleteAccount(id) {
+  if (switchingAccount || loggingOut || addingAccount || !confirm('删除此账号及其本地同步记录和登录信息？已下载文件会保留。')) return;
+  switchingAccount = true;
+  accountGeneration++;
+  clearTimeout(loginPollTimer);
+  try {
+    const response = await fetch('/api/accounts', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '删除账号失败');
+    if (id === currentAccountId) await resetAccountView();
+    else await refreshAccounts();
+  } catch (error) { $('#account-list-error').textContent = error.message; $('#account-list-error').hidden = false; }
+  finally { switchingAccount = false; loginPollTimer = setTimeout(pollLogin, 500); }
+}
+
+async function pollPendingLogin() {
+  if (!addingAccount || pendingLoginRequest) return;
+  pendingLoginRequest = (async () => {
+    const response = await fetch('/api/accounts/pending/status');
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法检查登录状态');
+    if (result.added) {
+      addingAccount = false;
+      pendingReady = false;
+      $('#account-add').disabled = false;
+      await resetAccountView();
+      renderAccountProfile(result.profile, 'logged_in');
+      $('#login-modal').close();
+      loginPollTimer = setTimeout(pollLogin, 500);
+      return;
+    }
+    $('#login-qr').hidden = !result.qrCode || result.expired;
+    if (result.qrCode) $('#login-qr').src = result.qrCode;
+    $('#login-verification').hidden = result.status !== 'verification';
+    if (result.image) $('#login-verification').src = result.image;
+    $('#login-status').textContent = result.error || (result.status === 'verification' ? '请完成身份验证' : result.status === 'confirm_phone' ? '已扫码，请在手机上确认登录' : result.expired ? '二维码已过期，请刷新' : result.qrCode ? '请使用抖音 App 扫码登录' : '正在加载登录页面');
+    if (!['duplicate', 'identity_error'].includes(result.status) && addingAccount) pendingLoginTimer = setTimeout(pollPendingLogin, 2000);
+  })();
+  try { await pendingLoginRequest; } catch (error) { $('#login-status').textContent = error.message; if (addingAccount) pendingLoginTimer = setTimeout(pollPendingLogin, 3000); }
+  finally { pendingLoginRequest = null; }
+}
+
+async function finishPendingLogin() {
+  clearTimeout(pendingLoginTimer);
+  if (pendingLoginRequest) await pendingLoginRequest.catch(() => {});
+  if (!addingAccount) return;
+  try {
+    const response = await fetch('/api/accounts/pending', { method: 'DELETE' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '取消登录失败');
+    addingAccount = false;
+    pendingReady = false;
+    $('#account-add').disabled = false;
+    loginPollTimer = setTimeout(pollLogin, 500);
+  } catch (error) {
+    $('#account-list-error').textContent = error.message;
+    $('#account-list-error').hidden = false;
+    if (!$('#login-modal').open) $('#login-modal').showModal();
+    $('#login-status').textContent = error.message;
+  }
+}
 async function pollLogin() {
-  if (loginPolling || loggingOut) return;
+  if (loginPolling || loggingOut || addingAccount || switchingAccount) return;
   clearTimeout(loginPollTimer);
   loginPolling = true;
   const generation = accountGeneration;
@@ -105,20 +219,9 @@ async function pollLogin() {
     if (result.status !== 'loading') initialLoginCheck = false;
     if (result.status === 'loading' || (result.status === 'logged_in' && !result.profile)) nextDelay = 2000;
     const profile = result.status === 'logged_in' ? result.profile : null;
-    renderSidebarAccount(profile, result.status);
-    $('#account-profile').hidden = !profile;
-    $('#account-empty').hidden = result.status === 'logged_in';
-    $('#login-open').hidden = result.status === 'logged_in';
+    renderAccountProfile(profile, result.status);
     if (profile) {
       refreshAccounts().catch(() => {});
-      $('#account-name').textContent = profile.nickname;
-      $('#account-signature').textContent = profile.signature || '暂无签名';
-      for (const [id, value] of [['account-following', profile.following], ['account-followers', profile.followers], ['account-likes', profile.likes]]) {
-        $(`#${id}`).textContent = value == null ? '--' : formatCount(Number(value));
-      }
-      const avatar = $('#account-avatar');
-      avatar.hidden = !profile.avatar;
-      if (profile.avatar && avatar.getAttribute('src') !== profile.avatar) avatar.src = profile.avatar;
     }
     const qr = $('#login-qr');
     qr.hidden = !result.qrCode || result.expired;
@@ -178,11 +281,14 @@ $('#login-close').addEventListener('click', () => $('#login-modal').close());
 let verificationInputQueue = Promise.resolve();
 function queueVerificationInput(path, body) {
   const accountId = currentAccountId;
+  const pending = addingAccount;
   verificationInputQueue = verificationInputQueue.then(async () => {
-    const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, accountId }) });
+    const target = pending ? path.replace('/api/login/', '/api/accounts/pending/') : path;
+    const response = await fetch(target, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, accountId }) });
     if (!response.ok) throw new Error((await response.json()).error || '验证操作失败');
     clearTimeout(loginPollTimer);
-    loginPollTimer = setTimeout(pollLogin, 300);
+    if (pending) { clearTimeout(pendingLoginTimer); pendingLoginTimer = setTimeout(pollPendingLogin, 300); }
+    else loginPollTimer = setTimeout(pollLogin, 300);
   }).catch(error => { $('#login-status').textContent = error.message; });
 }
 $('#login-verification').addEventListener('click', event => {
@@ -210,8 +316,9 @@ $('#login-verification').addEventListener('paste', event => {
   }
 });
 $('#login-modal').addEventListener('close', () => {
+  if (addingAccount) { if (pendingReady) finishPendingLogin(); return; }
   clearTimeout(loginPollTimer);
-  if (!loginPolling) loginPollTimer = setTimeout(pollLogin, 30000);
+  if (!loginPolling) loginPollTimer = setTimeout(pollLogin, 500);
 });
 $('#login-refresh').addEventListener('click', async () => {
   clearTimeout(loginPollTimer);
@@ -220,10 +327,11 @@ $('#login-refresh').addEventListener('click', async () => {
   $('#login-verification').hidden = true;
   $('#login-status').textContent = '正在刷新登录页面';
   try {
-    const response = await fetch('/api/login/refresh', { method: 'POST' });
+    const response = await fetch(addingAccount ? '/api/accounts/pending/refresh' : '/api/login/refresh', { method: 'POST' });
     if (!response.ok) throw new Error((await response.json()).error || '刷新失败');
   } catch (error) { $('#login-status').textContent = error.message; }
-  loginPollTimer = setTimeout(pollLogin, 1500);
+  if (addingAccount) { clearTimeout(pendingLoginTimer); pendingLoginTimer = setTimeout(pollPendingLogin, 1500); }
+  else loginPollTimer = setTimeout(pollLogin, 1500);
 });
 // saved 表示保持抖音原页面顺序，其余选项是用户主动选择的排序方式。
 const state = { source: 'like', like: [], collect: [], user: [], query: '', sort: 'saved', page: 1 };

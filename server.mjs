@@ -25,6 +25,7 @@ let accounts = [{ id: 'default', name: '默认账号', avatar: '' }];
 let activeAccountId = 'default';
 let activeCdp = 'http://127.0.0.1:9222';
 let accountSwitching = false;
+let pendingAccount = null;
 let accountSave = Promise.resolve();
 
 function saveAccounts() {
@@ -40,30 +41,48 @@ async function loadAccounts() {
   try {
     const data = JSON.parse(await fs.readFile(accountsPath, 'utf8'));
     const stored = Array.isArray(data.accounts) ? data.accounts.filter(a => a && (a.id === 'default' || /^[a-f0-9-]{36}$/.test(a.id))) : [];
-    if (!stored.some(a => a.id === 'default')) stored.unshift({ id: 'default', name: '默认账号', avatar: '' });
-    accounts = stored;
+    accounts = stored.length ? stored : [{ id: 'default', name: '默认账号', avatar: '' }];
     if (accounts.some(a => a.id === data.activeAccountId)) activeAccountId = data.activeAccountId;
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 
+function accountProfile(id) {
+  return id === 'default' ? path.resolve('.chrome-debug-profile') : path.join(profilesRoot, id);
+}
+
+async function existingAccountEndpoint(id) {
+  try {
+    const [portText, browserPath] = (await fs.readFile(path.join(accountProfile(id), 'DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
+    if (!/^\d+$/.test(portText) || !/^\/devtools\/browser\//.test(browserPath)) return null;
+    const endpoint = `http://127.0.0.1:${Number(portText)}`;
+    const version = await (await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1000) })).json();
+    return new URL(version.webSocketDebuggerUrl).pathname === browserPath ? endpoint : null;
+  } catch { return null; }
+}
+
+async function closeAccountBrowser(id, endpoint) {
+  // 9222 may be a browser supplied by the user; only close verified dedicated profiles.
+  if (!endpoint || endpoint === 'http://127.0.0.1:9222' || await existingAccountEndpoint(id) !== endpoint) return false;
+  const version = await (await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(2000) })).json();
+  const ws = await connectCdp(version.webSocketDebuggerUrl);
+  try { await cdpCall(ws, 'Browser.close', {}, 3000); } catch { /* Chrome may close the socket before replying. */ }
+  finally { ws.close(); }
+  for (let i = 0; i < 40; i++) {
+    if (!await existingAccountEndpoint(id)) return true;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error('旧账号浏览器未能关闭，请检查 Chrome 进程后重试');
+}
+
 async function accountEndpoint(id) {
-  const profile = id === 'default' ? path.resolve('.chrome-debug-profile') : path.join(profilesRoot, id);
+  const profile = accountProfile(id);
   if (id === 'default') {
     try {
       const tabs = await (await fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(1000) })).json();
       if (tabs.some(tab => tab.type === 'page' && /^https:\/\/www\.douyin\.com\/user\/self(?:[/?#]|$)/.test(tab.url))) return 'http://127.0.0.1:9222';
     } catch { /* 没有现成的默认浏览器时启动专用会话。 */ }
   }
-  const existingEndpoint = async () => {
-    try {
-      const [portText, browserPath] = (await fs.readFile(path.join(profile, 'DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
-      if (!/^\d+$/.test(portText) || !/^\/devtools\/browser\//.test(browserPath)) return null;
-      const endpoint = `http://127.0.0.1:${Number(portText)}`;
-      const version = await (await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1000) })).json();
-      return new URL(version.webSocketDebuggerUrl).pathname === browserPath ? endpoint : null;
-    } catch { return null; }
-  };
-  const existing = await existingEndpoint();
+  const existing = await existingAccountEndpoint(id);
   if (existing) return existing;
   const platformCandidates = process.platform === 'win32'
     ? [process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google/Chrome/Application/chrome.exe'), process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google/Chrome/Application/chrome.exe'), process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google/Chrome/Application/chrome.exe')]
@@ -82,10 +101,11 @@ async function accountEndpoint(id) {
   for (let i = 0; i < 40; i++) {
     await new Promise(resolve => setTimeout(resolve, 250));
     if (spawnError) throw spawnError;
-    const endpoint = await existingEndpoint();
+    const endpoint = await existingAccountEndpoint(id);
     if (endpoint) return endpoint;
     if (exitCode != null && exitCode !== 0) throw new Error(`Chrome 启动失败（退出代码 ${exitCode}），请检查浏览器依赖和运行用户`);
   }
+  if (exitCode == null) child.kill();
   throw new Error('账号浏览器启动失败，请检查 Chrome 和账号目录');
 }
 
@@ -1738,9 +1758,7 @@ let latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileU
 let syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
 let userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
 
-async function loginPageStatus(refresh = false) {
-  const currentAccountId = activeAccountId;
-  const endpoint = activeCdp;
+async function loginPageStatus(refresh = false, endpoint = activeCdp, currentAccountId = activeAccountId) {
   const tabs = await (await fetch(`${endpoint}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页，请检查无头 Chrome 是否已启动');
@@ -1776,6 +1794,7 @@ async function loginPageStatus(refresh = false) {
           const user = window.userInfoStore?.curLoginUserInfo;
           const profile = user?.nickname ? {
             nickname: String(user.nickname), signature: String(user.desc || ''),
+            identity: String(user.secUid || user.sec_uid || user.secUserId || user.sec_user_id || user.uid || user.userId || ''),
             avatar: String(user.avatar300Url || user.avatarUrl || ''),
             following: user.followingCount, followers: user.followerCount,
             likes: user.totalFavorited
@@ -1797,10 +1816,12 @@ async function loginPageStatus(refresh = false) {
     }
     if (status.status === 'logged_in' && status.profile && currentAccountId === activeAccountId) {
       const account = accounts.find(item => item.id === currentAccountId);
-      if (account && (account.name !== status.profile.nickname || account.avatar !== status.profile.avatar || account.signedOut)) {
+      if (account && (account.name !== status.profile.nickname || account.avatar !== status.profile.avatar || account.identity !== status.profile.identity || account.signedOut || account.placeholder)) {
         account.name = status.profile.nickname;
         account.avatar = status.profile.avatar;
         account.signedOut = false;
+        account.identity = status.profile.identity || account.identity;
+        delete account.placeholder;
         await saveAccounts();
       }
     }
@@ -1817,9 +1838,9 @@ async function loginPageStatus(refresh = false) {
   } finally { ws.close(); }
 }
 
-async function clickLoginVerification(x, y) {
+async function clickLoginVerification(x, y, endpoint = activeCdp) {
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) throw new Error('无效的验证操作');
-  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tabs = await (await fetch(`${endpoint}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1845,14 +1866,14 @@ async function clickLoginVerification(x, y) {
   } finally { ws.close(); }
 }
 
-async function typeLoginVerification({ text, key, selectAll }) {
+async function typeLoginVerification({ text, key, selectAll }, endpoint = activeCdp) {
   const allowedKeys = { Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowRight: 39, Home: 36, End: 35, Enter: 13 };
   if (typeof text === 'string') {
     if (!text || text.length > 256 || /[\x00-\x1f\x7f]/.test(text)) throw new Error('输入内容无效');
   } else if (selectAll !== true && !Object.hasOwn(allowedKeys, key)) {
     throw new Error('不支持的按键');
   }
-  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tabs = await (await fetch(`${endpoint}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1873,7 +1894,7 @@ async function typeLoginVerification({ text, key, selectAll }) {
 }
 
 async function logoutFromChrome() {
-  if (syncState.running || userSyncState.running || [...downloadJobs.values()].some(job => job.status === 'running')) {
+  if (syncState.running || userSyncState.running || detailRequests.size || [...downloadJobs.values()].some(job => job.status === 'running' || job.runningPromise && job.items.some(item => item.status === 'downloading'))) {
     throw new Error('请先等待同步或下载完成，或暂停下载后再退出');
   }
   const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
@@ -1891,16 +1912,20 @@ async function logoutFromChrome() {
       returnByValue: true
     });
     if (!result.result?.value) throw new Error('未找到抖音退出登录入口，请稍后重试');
+    let confirmed = false;
     for (let attempt = 0; attempt < 20; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 500));
       try {
-        await cdpCall(ws, 'Runtime.evaluate', {
+        if (!confirmed) confirmed = Boolean((await cdpCall(ws, 'Runtime.evaluate', {
           expression: `(() => {
             const dialogs = [...document.querySelectorAll('[role="dialog"], dialog')].filter(el => el.getClientRects().length && /退出登录/.test(el.innerText));
             const button = dialogs.flatMap(el => [...el.querySelectorAll('button')]).find(el => /^(确认退出|确认|退出登录)$/.test(el.innerText.trim()));
-            button?.click();
-          })()`
-        });
+            if (!button) return false;
+            button.click();
+            return true;
+          })()`,
+          returnByValue: true
+        })).result?.value);
       } catch { /* 导航期间执行上下文可能暂时不可用。 */ }
       const status = await loginPageStatus().catch(() => null);
       if (status && ['login', 'confirm_phone', 'verification'].includes(status.status)) {
@@ -1925,18 +1950,123 @@ async function switchAccount(id) {
     throw new Error('请先等待同步、作品加载或下载完成，或暂停下载后再切换账号');
   }
   accountSwitching = true;
+  const previousId = activeAccountId;
+  const previousEndpoint = activeCdp;
+  let closedPrevious = false;
+  let endpoint;
   try {
-    const endpoint = await accountEndpoint(id);
+    closedPrevious = await closeAccountBrowser(previousId, previousEndpoint);
+    endpoint = await accountEndpoint(id);
     const response = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(2000) });
     if (!response.ok) throw new Error('无法连接账号浏览器');
-    const previousId = activeAccountId;
     activeAccountId = id;
     try { await saveAccounts(); } catch (error) { activeAccountId = previousId; throw error; }
     activeCdp = endpoint;
     latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
     syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
     userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
+  } catch (error) {
+    if (endpoint && endpoint !== previousEndpoint) await closeAccountBrowser(id, endpoint).catch(() => {});
+    if (closedPrevious) {
+      try { activeCdp = await accountEndpoint(previousId); }
+      catch (restoreError) { error.message += `；恢复原账号浏览器失败：${restoreError.message}`; }
+    }
+    throw error;
   } finally { accountSwitching = false; }
+}
+
+function accountBusy() {
+  return syncState.running || userSyncState.running || detailRequests.size || [...downloadJobs.values()].some(job => job.status === 'running' || job.runningPromise && job.items.some(item => item.status === 'downloading'));
+}
+
+async function startPendingAccount() {
+  if (pendingAccount || accountBusy()) throw new Error('请先结束账号登录、同步或下载任务');
+  const previousId = activeAccountId;
+  let previousClosed = false;
+  const candidate = { id: randomUUID(), endpoint: null, previousId, previousClosed: false };
+  try {
+    const currentStatus = await loginPageStatus().catch(() => null);
+    const current = accounts.find(account => account.id === previousId);
+    if (current && !current.identity && current.name === '默认账号' && currentStatus && currentStatus.status !== 'logged_in') current.placeholder = true;
+    previousClosed = await closeAccountBrowser(previousId, activeCdp);
+    candidate.previousClosed = previousClosed;
+    for (const account of accounts) {
+      if (account.id === previousId || account.identity || account.placeholder) continue;
+      const endpoint = await accountEndpoint(account.id);
+      try {
+        const status = await loginPageStatus(false, endpoint, account.id);
+        if (status.status === 'logged_in' && status.profile?.identity) {
+          account.identity = status.profile.identity;
+          await saveAccounts();
+        }
+      } finally { await closeAccountBrowser(account.id, endpoint); }
+    }
+    candidate.endpoint = await accountEndpoint(candidate.id);
+    pendingAccount = candidate;
+  } catch (error) {
+    if (candidate.endpoint) await closeAccountBrowser(candidate.id, candidate.endpoint).catch(() => {});
+    if (previousClosed) await accountEndpoint(previousId).then(endpoint => { activeCdp = endpoint; }).catch(restore => { error.message += `；恢复原账号失败：${restore.message}`; });
+    throw error;
+  }
+}
+
+async function cancelPendingAccount() {
+  if (!pendingAccount) return;
+  const pending = pendingAccount;
+  await closeAccountBrowser(pending.id, pending.endpoint);
+  if (pending.previousClosed) activeCdp = await accountEndpoint(pending.previousId);
+  pendingAccount = null;
+  await fs.rm(accountProfile(pending.id), { recursive: true, force: true });
+}
+
+async function pendingAccountStatus(refresh = false) {
+  if (!pendingAccount) throw new Error('登录已结束，请重新添加账号');
+  const pending = pendingAccount;
+  const status = await loginPageStatus(refresh, pending.endpoint, pending.id);
+  if (status.status !== 'logged_in' || !status.profile) return status;
+  if (!status.profile.identity) return { status: 'identity_error', error: '无法获取抖音账号标识，请取消后重试' };
+  const unknown = accounts.find(account => !account.identity && !account.placeholder);
+  if (unknown) return { status: 'identity_error', error: `无法确认已有账号“${unknown.name || '未命名账号'}”的身份，请切换到该账号确认登录后重试` };
+  if (accounts.some(account => account.identity === status.profile.identity)) return { status: 'duplicate', error: '该抖音账号已在列表中，请直接切换账号' };
+  const account = { id: pending.id, name: status.profile.nickname, avatar: status.profile.avatar || '', identity: status.profile.identity };
+  const previousId = activeAccountId;
+  accounts.push(account);
+  activeAccountId = account.id;
+  try { await saveAccounts(); } catch (error) { accounts.pop(); activeAccountId = previousId; throw error; }
+  activeCdp = pending.endpoint;
+  pendingAccount = null;
+  latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
+  syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
+  userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
+  return { ...status, added: true };
+}
+
+async function deleteAccount(id) {
+  const account = accounts.find(item => item.id === id);
+  if (!account || account.placeholder) throw new Error('账号不存在');
+  if (pendingAccount || accountBusy()) throw new Error('请先结束账号登录、同步或下载任务');
+  if (id === 'default') {
+    try {
+      const tabs = await (await fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(1000) })).json();
+      if (tabs.some(tab => tab.type === 'page' && /douyin\.com\/user\/self/.test(tab.url))) throw new Error('默认账号浏览器由外部启动，请先关闭该浏览器后删除');
+    } catch (error) { if (error.message.includes('外部启动')) throw error; }
+  }
+  if (id === activeAccountId) {
+    if (activeCdp === 'http://127.0.0.1:9222') throw new Error('当前浏览器由外部启动，请先切换账号后删除');
+    let next = accounts.find(item => item.id !== id);
+    if (!next) {
+      next = { id: randomUUID(), name: '默认账号', avatar: '', placeholder: true };
+      accounts.push(next);
+    }
+    try { await switchAccount(next.id); } catch (error) { if (next.placeholder) accounts = accounts.filter(item => item !== next); throw error; }
+  }
+  const endpoint = await existingAccountEndpoint(id);
+  if (endpoint) await closeAccountBrowser(id, endpoint);
+  const previous = accounts;
+  accounts = accounts.filter(item => item.id !== id);
+  try { await saveAccounts(); } catch (error) { accounts = previous; throw error; }
+  library.clear(id);
+  await fs.rm(accountProfile(id), { recursive: true, force: true });
 }
 
 // 后台启动同步，避免 HTTP 请求一直等待页面滚动完成。
@@ -1979,20 +2109,50 @@ const server = http.createServer(async (req, res) => {
     // 启动和查询同步状态的 API；静态文件请求在下面统一处理。
     const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (await access(req, res, requestUrl)) return;
-    if (accountSwitching && requestUrl.pathname.startsWith('/api/') && requestUrl.pathname !== '/api/accounts') return send(res, 409, JSON.stringify({ error: '正在切换账号，请稍候' }));
+    if (accountSwitching && requestUrl.pathname.startsWith('/api/')) return send(res, 409, JSON.stringify({ error: '正在处理账号，请稍候' }));
+    if (pendingAccount && requestUrl.pathname.startsWith('/api/') && !requestUrl.pathname.startsWith('/api/accounts/pending') && requestUrl.pathname !== '/api/accounts' && !requestUrl.pathname.startsWith('/api/video/stream')) return send(res, 409, JSON.stringify({ error: '请先完成或取消添加账号' }));
     if (requestUrl.pathname === '/api/accounts' && req.method === 'GET') {
       for (const account of accounts) {
         if (account.avatar) {
           try { const value = new URL(account.avatar, 'http://localhost').searchParams.get('url'); if (isDouyinMediaUrl(value)) mediaUrls.set(value, Date.now() + 15 * 60 * 1000); } catch {}
         }
       }
-      return send(res, 200, JSON.stringify({ activeAccountId, accounts }));
+      return send(res, 200, JSON.stringify({ activeAccountId, accounts: accounts.filter(account => !account.placeholder) }));
     }
     if (requestUrl.pathname === '/api/accounts' && req.method === 'POST') {
-      const account = { id: randomUUID(), name: '新账号', avatar: '' };
-      accounts.push(account);
-      try { await switchAccount(account.id); } catch (error) { accounts = accounts.filter(item => item.id !== account.id); throw error; }
-      return send(res, 201, JSON.stringify({ activeAccountId, accounts }));
+      accountSwitching = true;
+      try { await startPendingAccount(); } finally { accountSwitching = false; }
+      return send(res, 201, JSON.stringify({ pending: true }));
+    }
+    if (requestUrl.pathname === '/api/accounts/pending' && req.method === 'DELETE') {
+      accountSwitching = true;
+      try { await cancelPendingAccount(); } finally { accountSwitching = false; }
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
+    if (requestUrl.pathname === '/api/accounts/pending/status' && req.method === 'GET') {
+      accountSwitching = true;
+      try { return send(res, 200, JSON.stringify(await pendingAccountStatus())); } finally { accountSwitching = false; }
+    }
+    if (requestUrl.pathname === '/api/accounts/pending/refresh' && req.method === 'POST') {
+      if (!pendingAccount) throw new Error('登录已结束，请重新添加账号');
+      await loginPageStatus(true, pendingAccount.endpoint, pendingAccount.id);
+      return send(res, 202, JSON.stringify({ status: 'loading' }));
+    }
+    if (requestUrl.pathname === '/api/accounts/pending/verification/click' && req.method === 'POST') {
+      if (!pendingAccount) throw new Error('登录已结束，请重新添加账号');
+      const { x, y } = await readJsonBody(req);
+      await clickLoginVerification(x, y, pendingAccount.endpoint);
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
+    if (requestUrl.pathname === '/api/accounts/pending/verification/type' && req.method === 'POST') {
+      if (!pendingAccount) throw new Error('登录已结束，请重新添加账号');
+      await typeLoginVerification(await readJsonBody(req), pendingAccount.endpoint);
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
+    if (requestUrl.pathname === '/api/accounts' && req.method === 'DELETE') {
+      const { id } = await readJsonBody(req);
+      await deleteAccount(id);
+      return send(res, 200, JSON.stringify({ activeAccountId }));
     }
     if (requestUrl.pathname === '/api/accounts/switch' && req.method === 'POST') {
       const { id } = await readJsonBody(req);
@@ -2003,7 +2163,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, JSON.stringify(await loginPageStatus()));
     }
     if (requestUrl.pathname === '/api/login/logout' && req.method === 'POST') {
-      await logoutFromChrome();
+      accountSwitching = true;
+      try { await logoutFromChrome(); } finally { accountSwitching = false; }
       return send(res, 200, JSON.stringify({ ok: true }));
     }
     if (requestUrl.pathname === '/api/login/refresh' && req.method === 'POST') {
@@ -2178,6 +2339,11 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { send(res, 500, JSON.stringify({ error: error.message })); }
 });
 await loadAccounts();
+for (const account of accounts) {
+  if (account.id === activeAccountId) continue;
+  const endpoint = await existingAccountEndpoint(account.id);
+  if (endpoint) await closeAccountBrowser(account.id, endpoint).catch(error => console.error(`关闭闲置账号浏览器失败：${error.message}`));
+}
 activeCdp = await accountEndpoint(activeAccountId);
 await loadDownloadJobs();
 server.listen(port, host, () => console.log(`Douyin Library Viewer: http://${host}:${port}`));
