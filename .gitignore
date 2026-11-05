@@ -1,4 +1,6 @@
 .chrome-debug-profile/
+.chrome-accounts/
+accounts.json
 node_modules/
 downloads/
 download-state.json

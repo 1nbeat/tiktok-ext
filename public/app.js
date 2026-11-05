@@ -2,27 +2,112 @@
 const PAGE_SIZE = 24;
 const $ = selector => document.querySelector(selector);
 
+function showView(view) {
+  if (!['library', 'downloads', 'account'].includes(view)) return;
+  document.querySelectorAll('.workspace-view').forEach(section => { section.hidden = section.id !== `view-${view}`; });
+  document.querySelectorAll('.nav-item').forEach(button => {
+    const active = button.dataset.view === view;
+    button.classList.toggle('active', active);
+    if (active) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
+}
+$('.main-nav').addEventListener('click', event => {
+  const button = event.target.closest('[data-view]');
+  if (button) showView(button.dataset.view);
+});
+$('#sidebar-account').addEventListener('click', () => showView('account'));
+
+function renderSidebarAccount(profile, status) {
+  const avatar = $('#sidebar-avatar');
+  avatar.hidden = !profile?.avatar;
+  $('#sidebar-avatar-placeholder').hidden = Boolean(profile?.avatar);
+  if (profile?.avatar && avatar.getAttribute('src') !== profile.avatar) avatar.src = profile.avatar;
+  $('#sidebar-account-name').textContent = profile?.nickname || '抖音账号';
+  $('#sidebar-account-status').textContent = status === 'logged_in' ? '已登录' : status === 'loading' ? '正在检查登录状态' : '未登录';
+  $('#sidebar-account').classList.toggle('is-logged-in', status === 'logged_in');
+}
+
 let loginPollTimer;
 let loginPolling = false;
 let initialLoginCheck = true;
 let loggingOut = false;
+let loginLoadingSince = 0;
+let switchingAccount = false;
+let currentAccountId = '';
+let accountGeneration = 0;
+async function refreshAccounts() {
+  const response = await fetch('/api/accounts');
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || '无法加载账号');
+  currentAccountId = data.activeAccountId;
+  $('#account-list').innerHTML = data.accounts.map(account => `<div class="account-row"><span class="account-row-avatar">${account.avatar ? `<img src="${escapeHtml(account.avatar)}" alt="">` : '人'}</span><span class="account-row-name">${escapeHtml(account.name || '未登录账号')}${account.signedOut ? '（已退出）' : ''}</span>${account.id === data.activeAccountId ? '<span class="account-current">当前账号</span>' : `<button type="button" class="secondary account-switch" data-account-id="${escapeHtml(account.id)}">切换</button>`}</div>`).join('');
+}
+
+async function changeAccount(id) {
+  if (switchingAccount || loggingOut) return;
+  switchingAccount = true;
+  accountGeneration++;
+  loggingOut = true;
+  clearTimeout(loginPollTimer);
+  const error = $('#account-list-error');
+  error.hidden = true;
+  $('#account-add').disabled = true;
+  document.querySelectorAll('.account-switch').forEach(button => { button.disabled = true; });
+  try {
+    const response = await fetch(id ? '/api/accounts/switch' : '/api/accounts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(id ? { id } : {}) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '切换账号失败');
+    state.like = []; state.collect = []; state.user = []; state.page = 1;
+    $('#sync-status').hidden = true;
+    $('#account-profile').hidden = true;
+    $('#account-empty').hidden = false;
+    $('#login-open').hidden = false;
+    renderSidebarAccount(null, 'loading');
+    render();
+    await refreshAccounts();
+    initialLoginCheck = true;
+  } catch (cause) {
+    error.textContent = cause.message;
+    error.hidden = false;
+  } finally {
+    switchingAccount = false;
+    loggingOut = false;
+    $('#account-add').disabled = false;
+    document.querySelectorAll('.account-switch').forEach(button => { button.disabled = false; });
+    clearTimeout(loginPollTimer);
+    loginPollTimer = setTimeout(pollLogin, 500);
+  }
+}
+$('#account-add').addEventListener('click', () => changeAccount());
+$('#account-list').addEventListener('click', event => {
+  const button = event.target.closest('[data-account-id]');
+  if (button) changeAccount(button.dataset.accountId);
+});
 async function pollLogin() {
   if (loginPolling || loggingOut) return;
   clearTimeout(loginPollTimer);
   loginPolling = true;
+  const generation = accountGeneration;
   let nextDelay = 30000;
   try {
     const response = await fetch('/api/login/status');
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '无法检查登录状态');
-    if (loggingOut) return;
+    if (loggingOut || generation !== accountGeneration) return;
+    const waitingForQr = (result.status === 'login' && !result.qrCode && !result.expired) || result.status === 'loading';
+    if (waitingForQr) loginLoadingSince ||= Date.now();
+    else loginLoadingSince = 0;
     if (initialLoginCheck && ['login', 'verification', 'confirm_phone'].includes(result.status) && !$('#login-modal').open) $('#login-modal').showModal();
     if (result.status !== 'loading') initialLoginCheck = false;
     if (result.status === 'loading' || (result.status === 'logged_in' && !result.profile)) nextDelay = 2000;
     const profile = result.status === 'logged_in' ? result.profile : null;
+    renderSidebarAccount(profile, result.status);
     $('#account-profile').hidden = !profile;
+    $('#account-empty').hidden = result.status === 'logged_in';
     $('#login-open').hidden = result.status === 'logged_in';
     if (profile) {
+      refreshAccounts().catch(() => {});
       $('#account-name').textContent = profile.nickname;
       $('#account-signature').textContent = profile.signature || '暂无签名';
       for (const [id, value] of [['account-following', profile.following], ['account-followers', profile.followers], ['account-likes', profile.likes]]) {
@@ -38,11 +123,12 @@ async function pollLogin() {
     const verification = $('#login-verification');
     verification.hidden = result.status !== 'verification';
     if (result.image) verification.src = result.image;
-    $('#login-status').textContent = result.status === 'logged_in' ? '已登录' : result.status === 'verification' ? '抖音需要身份验证，请在下方选择验证方式' : result.status === 'confirm_phone' ? '已扫码，请在手机上确认登录' : result.expired ? '二维码已过期，请刷新' : result.qrCode ? '请使用抖音 App 扫码登录' : '正在加载登录页面';
+    $('#login-status').textContent = result.status === 'logged_in' ? '已登录' : result.status === 'verification' ? '抖音需要身份验证，请在下方选择验证方式' : result.status === 'confirm_phone' ? '已扫码，请在手机上确认登录' : result.expired ? '二维码已过期，请刷新' : result.qrCode ? '请使用抖音 App 扫码登录' : loginLoadingSince && Date.now() - loginLoadingSince > 15000 ? '二维码加载失败，请刷新二维码后重试' : '正在加载登录页面';
     $('#login-open').textContent = result.status === 'logged_in' ? '抖音已登录' : '抖音登录';
     if (result.status === 'logged_in' && $('#login-modal').open) $('#login-modal').close();
   } catch (error) {
     $('#login-status').textContent = error.message;
+    $('#sidebar-account-status').textContent = '连接失败';
     $('#login-qr').hidden = true;
     $('#login-verification').hidden = true;
   } finally {
@@ -67,9 +153,12 @@ $('#account-logout').addEventListener('click', async () => {
     if (!response.ok) throw new Error(result.error || '退出登录失败');
     state.like = []; state.collect = []; state.user = []; state.page = 1;
     $('#account-profile').hidden = true;
+    renderSidebarAccount(null, 'login');
+    $('#account-empty').hidden = false;
     $('#login-open').hidden = false;
     $('#sync-status').hidden = true;
     render();
+    refreshAccounts().catch(() => {});
   } catch (cause) {
     error.textContent = cause.message;
     error.hidden = false;
@@ -82,14 +171,39 @@ $('#account-logout').addEventListener('click', async () => {
   }
 });
 $('#login-close').addEventListener('click', () => $('#login-modal').close());
-$('#login-verification').addEventListener('click', async event => {
-  const rect = event.currentTarget.getBoundingClientRect();
-  try {
-    const response = await fetch('/api/login/verification/click', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height }) });
+let verificationInputQueue = Promise.resolve();
+function queueVerificationInput(path, body) {
+  const accountId = currentAccountId;
+  verificationInputQueue = verificationInputQueue.then(async () => {
+    const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, accountId }) });
     if (!response.ok) throw new Error((await response.json()).error || '验证操作失败');
     clearTimeout(loginPollTimer);
-    loginPollTimer = setTimeout(pollLogin, 500);
-  } catch (error) { $('#login-status').textContent = error.message; }
+    loginPollTimer = setTimeout(pollLogin, 300);
+  }).catch(error => { $('#login-status').textContent = error.message; });
+}
+$('#login-verification').addEventListener('click', event => {
+  const rect = event.currentTarget.getBoundingClientRect();
+  event.currentTarget.focus();
+  queueVerificationInput('/api/login/verification/click', { x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height });
+});
+$('#login-verification').addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    queueVerificationInput('/api/login/verification/type', { selectAll: true });
+  } else if (!event.ctrlKey && !event.metaKey && !event.altKey && ['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Enter'].includes(event.key)) {
+    event.preventDefault();
+    queueVerificationInput('/api/login/verification/type', { key: event.key });
+  } else if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.length === 1) {
+    event.preventDefault();
+    queueVerificationInput('/api/login/verification/type', { text: event.key });
+  }
+});
+$('#login-verification').addEventListener('paste', event => {
+  const text = event.clipboardData?.getData('text/plain');
+  if (text) {
+    event.preventDefault();
+    queueVerificationInput('/api/login/verification/type', { text });
+  }
 });
 $('#login-modal').addEventListener('close', () => {
   clearTimeout(loginPollTimer);
@@ -97,6 +211,7 @@ $('#login-modal').addEventListener('close', () => {
 });
 $('#login-refresh').addEventListener('click', async () => {
   clearTimeout(loginPollTimer);
+  loginLoadingSince = Date.now();
   $('#login-qr').hidden = true;
   $('#login-verification').hidden = true;
   $('#login-status').textContent = '正在刷新登录页面';
@@ -250,6 +365,8 @@ function renderDownloadJob(job) {
   $('#download-specified').disabled = ['running', 'pending'].includes(job?.status);
   const panel = $('#download-status');
   panel.hidden = !job || isDismissedDownloadJob(job);
+  $('#download-empty').hidden = !panel.hidden;
+  $('#nav-download-indicator').hidden = !job || !['running', 'pending'].includes(job.status);
   if (!job) return;
   const finished = Number(job.completed || 0) + Number(job.skipped || 0);
   const progress = job.total ? Math.round(finished * 100 / job.total) : 0;
@@ -311,6 +428,7 @@ async function createDownloadJob({ detail } = {}) {
   if (!response.ok) throw new Error(job.error || '创建下载任务失败');
   renderDownloadJob(job);
   render();
+  showView('downloads');
   pollDownloadJob(job.id);
 }
 
@@ -998,7 +1116,9 @@ $('#specified-download-open').addEventListener('click', async () => {
       $('#specified-download-error').textContent = error.message;
     } else {
       $('#download-status').hidden = false;
+      $('#download-empty').hidden = true;
       $('#download-detail').textContent = error.message;
+      showView('downloads');
     }
   } finally {
     button.disabled = false;
@@ -1009,7 +1129,7 @@ $('#specified-download-url').addEventListener('keydown', event => {
   if (event.key === 'Enter') $('#specified-download-open').click();
 });
 $('#download-all').addEventListener('click', () => {
-  createDownloadJob().catch(error => { $('#download-status').hidden = false; $('#download-detail').textContent = error.message; });
+  createDownloadJob().catch(error => { $('#download-status').hidden = false; $('#download-empty').hidden = true; $('#download-detail').textContent = error.message; showView('downloads'); });
 });
 $('#download-confirm-start').addEventListener('click', () => closeDownloadConfirmation(true));
 $('#download-confirm-cancel').addEventListener('click', () => closeDownloadConfirmation(false));
@@ -1102,6 +1222,7 @@ $('#sync-status-close').addEventListener('click', () => { $('#sync-status').hidd
 $('#download-status-close').addEventListener('click', () => {
   rememberDismissedDownloadJob(downloadJob);
   $('#download-status').hidden = true;
+  $('#download-empty').hidden = false;
 });
 // 页面刷新后恢复服务端内存中的最近一次同步结果。
 async function restoreLatest() {
@@ -1135,3 +1256,4 @@ async function restoreLatest() {
 render();
 restoreLatest();
 pollLogin();
+refreshAccounts().catch(error => { $('#account-list-error').textContent = error.message; $('#account-list-error').hidden = false; });

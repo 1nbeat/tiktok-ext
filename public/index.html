@@ -10,27 +10,27 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <!-- 顶部操作区：同步在 Chrome 中的抖音页面，结果显示在下方。 -->
-      <header class="topbar">
-        <div class="topbar-heading">
-          <h1>抖音下载助手</h1>
-        </div>
-        <div class="topbar-actions">
-          <div class="topbar-buttons">
-            <div class="topbar-data-actions">
-              <button id="login-open" class="secondary" type="button">抖音登录</button>
-              <button id="profile-sync" class="secondary" type="button">加载用户作品</button>
-              <button id="sync" class="primary">同步喜欢与收藏</button>
-            </div>
-            <span class="topbar-divider" aria-hidden="true"></span>
-            <div class="topbar-download-actions">
-              <button id="download-specified" class="secondary" type="button">下载作品链接</button>
-              <button id="download-all" class="secondary" disabled>批量下载当前列表</button>
-            </div>
-          </div>
-        </div>
-      </header>
+    <div class="app-layout">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">D</span><div><strong>抖音下载助手</strong><span>作品管理</span></div></div>
+        <nav class="main-nav" aria-label="主导航">
+          <button class="nav-item active" type="button" data-view="library" aria-current="page"><span class="nav-icon" aria-hidden="true">▦</span>作品库</button>
+          <button class="nav-item" type="button" data-view="downloads"><span class="nav-icon" aria-hidden="true">↓</span>下载任务<span id="nav-download-indicator" class="nav-indicator" hidden></span></button>
+          <button class="nav-item" type="button" data-view="account"><span class="nav-icon" aria-hidden="true">◉</span>账号</button>
+        </nav>
+        <button id="sidebar-account" class="sidebar-account" type="button" aria-label="查看账号">
+          <span class="sidebar-avatar-wrap"><img id="sidebar-avatar" alt="" width="36" height="36" hidden /><span id="sidebar-avatar-placeholder" class="sidebar-avatar-placeholder" aria-hidden="true">人</span></span>
+          <span class="sidebar-account-details"><strong id="sidebar-account-name">抖音账号</strong><span id="sidebar-account-status">正在检查登录状态</span></span>
+          <span class="sidebar-account-arrow" aria-hidden="true">›</span>
+        </button>
+      </aside>
+      <main class="shell">
+      <section id="view-account" class="workspace-view" hidden>
+        <header class="view-header"><div><span class="view-eyebrow">ACCOUNT</span><h1>账号</h1><p>管理抖音账号</p></div><button id="account-add" class="primary" type="button">添加账号</button></header>
+      <div class="section-heading"><h2>账号列表</h2></div>
+      <p id="account-list-error" class="account-logout-error" role="alert" hidden></p>
+      <div id="account-list" class="account-list"></div>
+      <div class="section-heading"><h2>当前账号</h2></div>
       <section id="account-profile" class="account-profile" aria-label="当前抖音账号" hidden>
         <img id="account-avatar" class="account-avatar" alt="" width="48" height="48" hidden />
         <div class="account-details">
@@ -45,23 +45,12 @@
         <button id="account-logout" class="secondary" type="button">退出登录</button>
         <p id="account-logout-error" class="account-logout-error" role="alert" hidden></p>
       </section>
-      <!-- 同步开始后才展示状态和动态进度，避免首页默认占用一块空白区域。 -->
-      <section class="status" id="sync-status" hidden>
-        <div class="status-heading">
-          <div id="status">
-            等待同步。
-          </div>
-          <button id="sync-status-close" class="status-close" type="button" hidden>
-            关闭
-          </button>
-        </div>
-        <div class="progress-track" id="progress-track" hidden>
-          <div class="progress-value" id="progress-value">
-          </div>
-        </div>
-        <div class="progress-detail" id="progress-detail">
-        </div>
+      <div id="account-empty" class="workspace-empty"><strong>尚未登录</strong><p>登录后同步你的抖音作品</p><button id="login-open" class="primary" type="button">抖音登录</button></div>
       </section>
+      <section id="view-downloads" class="workspace-view" hidden>
+        <header class="view-header"><div><span class="view-eyebrow">DOWNLOADS</span><h1>下载任务</h1><p>查看和管理下载进度</p></div><button id="download-specified" class="primary" type="button">下载作品链接</button></header>
+        <div class="section-heading"><h2>当前任务</h2><span>下载记录</span></div>
+        <div id="download-empty" class="workspace-empty"><strong>暂无下载任务</strong><p>从作品库批量下载，或添加作品链接</p></div>
       <section class="download-status" id="download-status" hidden>
         <div class="download-header">
           <strong id="download-title">
@@ -96,6 +85,11 @@
           </button>
         </div>
       </section>
+      </section>
+      <section id="view-library" class="workspace-view">
+        <header class="view-header"><div><span class="view-eyebrow">LIBRARY</span><h1>作品库</h1><p>浏览喜欢、收藏和用户作品</p></div><div class="view-actions"><button id="profile-sync" class="secondary" type="button">加载用户作品</button><button id="sync" class="primary" type="button">同步喜欢与收藏</button></div></header>
+      <section class="status" id="sync-status" hidden><div class="status-heading"><div id="status">等待同步。</div><button id="sync-status-close" class="status-close" type="button" hidden>关闭</button></div><div class="progress-track" id="progress-track" hidden><div class="progress-value" id="progress-value"></div></div><div class="progress-detail" id="progress-detail"></div></section>
+      <div class="library-actions"><div><h2>我的作品集</h2><span>作品列表</span></div><button id="download-all" class="secondary" type="button" disabled>批量下载当前列表</button></div>
       <!-- 各数据源只在前端切换，避免重复抓取。 -->
       <nav class="tabs" aria-label="内容类型">
         <button class="tab active" data-source="like">
@@ -146,7 +140,9 @@
       </section>
       <nav id="pagination" class="pagination" aria-label="分页">
       </nav>
+      </section>
     </main>
+    </div>
     <dialog id="download-confirm-modal" class="download-confirm-modal" aria-labelledby="download-confirm-title">
       <button id="download-confirm-close" class="modal-close" type="button" aria-label="关闭确认窗口">
         ×
@@ -244,7 +240,7 @@
         <h2 id="login-title">抖音登录</h2>
         <p id="login-status" role="status">正在检查登录状态</p>
         <img id="login-qr" alt="抖音登录二维码" width="200" height="200" hidden />
-        <img id="login-verification" alt="抖音身份验证页面，点击选择验证方式" hidden />
+        <img id="login-verification" alt="抖音身份验证页面" tabindex="0" role="application" aria-label="抖音身份验证页面，点击输入框后可输入验证码" hidden />
         <div class="download-confirm-actions">
           <button id="login-refresh" type="button">刷新二维码</button>
         </div>

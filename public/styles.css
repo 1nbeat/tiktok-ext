@@ -1147,6 +1147,13 @@ h1 {
 .account-stats dt { color:#66727f; font-size:12px }
 .account-stats dd { margin:0; font-size:14px; font-weight:600 }
 .account-logout-error { width:100%; margin:0; color:#c62846; font-size:13px }
+.account-list { border-top:1px solid #e4e7e9 }
+.account-row { display:flex; align-items:center; gap:12px; min-height:66px; padding:12px 0; border-bottom:1px solid #e4e7e9 }
+.account-row-avatar { display:grid; place-items:center; width:38px; height:38px; flex:none; border-radius:50%; background:#e9edef; color:#77818a }
+.account-row-avatar img { width:38px; height:38px; border-radius:50%; object-fit:cover }
+.account-row-name { flex:1; min-width:0; overflow-wrap:anywhere; font-size:14px; font-weight:600 }
+.account-current { color:#398568; font-size:12px }
+.account-switch { padding:7px 13px; font-size:13px }
 @media(max-width:640px) {
   .account-profile { flex-wrap:wrap }
   .account-stats { width:100%; padding-left:62px; gap:16px }
@@ -1770,4 +1777,86 @@ h1 {
     align-items:center;
     gap:8px
   }
+}
+
+/* Workspace navigation and view layout. */
+:root { background:#f6f7f8 }
+.app-layout { min-height:100vh; display:grid; grid-template-columns:224px minmax(0,1fr) }
+.sidebar { position:sticky; top:0; height:100vh; display:flex; flex-direction:column; padding:30px 16px 20px; background:#fff; border-right:1px solid #e6e8eb }
+.brand { display:flex; gap:11px; align-items:center; padding:0 7px 36px }
+.brand-mark { display:grid; place-items:center; width:37px; height:37px; flex:none; border-radius:8px; background:#22272d; color:#fff; font-size:20px; font-weight:800 }
+.brand strong,.brand div span { display:block }
+.brand strong { color:#20242a; font-size:14px; white-space:nowrap }
+.brand div span { margin-top:1px; color:#969da5; font-size:11px }
+.main-nav { display:grid; gap:5px }
+.nav-item { display:flex; align-items:center; gap:11px; width:100%; height:42px; padding:0 12px; border:0; border-radius:6px; background:transparent; color:#69717a; font:inherit; font-size:14px; text-align:left; cursor:pointer }
+.nav-item:hover { background:#f5f6f7; color:#24282d }
+.nav-item.active { background:#fff0f2; color:#d62d50; font-weight:600 }
+.nav-icon { display:inline-grid; place-items:center; width:19px; font-size:18px; line-height:1 }
+.nav-indicator { width:7px; height:7px; margin-left:auto; border-radius:50%; background:#e33c5e }
+.nav-indicator[hidden] { display:none }
+.sidebar-account { display:flex; align-items:center; gap:10px; width:100%; min-width:0; margin-top:auto; padding:12px 8px 2px; border:0; border-top:1px solid #e6e8eb; background:transparent; color:#343a40; text-align:left; cursor:pointer }
+.sidebar-account:hover .sidebar-account-details strong { color:#d62d50 }
+.sidebar-avatar-wrap { width:36px; height:36px; flex:none }
+.sidebar-avatar-wrap img,.sidebar-avatar-placeholder { width:36px; height:36px; border-radius:50%; object-fit:cover }
+.sidebar-avatar-placeholder { display:grid; place-items:center; background:#eef0f2; color:#858d95; font-size:13px }
+.sidebar-avatar-wrap [hidden] { display:none }
+.sidebar-account-details { min-width:0; flex:1 }
+.sidebar-account-details strong,.sidebar-account-details > span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.sidebar-account-details strong { font-size:13px }
+.sidebar-account-details > span { margin-top:2px; color:#92999f; font-size:11px }
+.sidebar-account.is-logged-in .sidebar-account-details > span { color:#398568 }
+.sidebar-account-arrow { color:#aab0b5; font-size:20px }
+.shell { width:100%; max-width:1500px; min-width:0; margin:0 auto; padding:42px 44px 72px }
+.workspace-view[hidden] { display:none }
+.view-header { min-height:104px; display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding-bottom:27px; border-bottom:1px solid #e4e7e9 }
+.view-eyebrow { color:#b05b6d; font-size:10px; font-weight:700; letter-spacing:0 }
+.view-header h1 { margin:4px 0 0; color:#20242a; font-size:26px; line-height:1.25 }
+.view-header p { margin:7px 0 0; color:#9299a1; font-size:13px }
+.view-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; padding-top:15px }
+.view-header > button { margin-top:15px }
+.view-header .primary,.view-header .secondary,.library-actions .secondary { min-height:38px; padding:0 14px; font-size:13px }
+.section-heading,.library-actions { display:flex; align-items:center; justify-content:space-between; gap:14px; margin:30px 0 18px }
+.section-heading h2,.library-actions h2 { margin:0; color:#272c31; font-size:16px }
+.section-heading span,.library-actions span { display:block; margin-top:3px; color:#9aa0a6; font-size:12px }
+.tabs { display:flex; width:max-content; max-width:100%; background:#eaeef0; border:0; border-radius:7px }
+.tab { color:#6c747c }
+.toolbar { margin:16px 0 20px }
+.search { background:#fff }
+.grid { grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:14px }
+.empty { padding:80px 0; border:0; border-top:1px solid #e4e7e9; background:transparent }
+.workspace-empty { padding:90px 20px; text-align:center; border-top:1px solid #e4e7e9; color:#888f97 }
+.workspace-empty[hidden] { display:none }
+.workspace-empty strong { color:#454c53; font-size:15px }
+.workspace-empty p { margin:8px 0 20px; font-size:13px }
+.download-status { margin-top:0; border-left:1px solid #e1e5e9; box-shadow:none }
+.account-profile { margin-top:28px; flex-wrap:wrap; padding:22px 0; border-top:1px solid #e4e7e9 }
+.account-avatar { width:56px; height:56px }
+.account-details { flex:1 1 160px }
+.account-stats { margin-right:24px }
+@media(max-width:850px) {
+  .app-layout { grid-template-columns:1fr }
+  .sidebar { position:static; height:auto; padding:15px 20px 0; border-right:0; border-bottom:1px solid #e6e8eb }
+  .brand { padding:0 0 15px }
+  .main-nav { display:flex; gap:4px }
+  .nav-item { width:auto; min-width:92px; justify-content:center; border-radius:6px 6px 0 0 }
+  .sidebar-account { position:fixed; z-index:10; left:12px; bottom:12px; width:min(200px,calc(100vw - 24px)); margin:0; padding:8px 10px; border:1px solid #e0e4e7; border-radius:7px; background:#fff; box-shadow:0 3px 14px #20242a1a }
+  .shell { padding:28px 24px 100px }
+}
+@media(max-width:560px) {
+  .sidebar { padding:12px 14px 0 }
+  .brand { padding-bottom:11px }
+  .brand-mark { width:32px; height:32px; font-size:17px }
+  .main-nav { justify-content:space-between }
+  .nav-item { flex:1; min-width:0; padding:0 6px; font-size:13px }
+  .shell { padding:24px 16px 100px }
+  .view-header { flex-direction:column; gap:14px; padding-bottom:20px }
+  .view-header h1 { font-size:23px }
+  .view-actions { justify-content:flex-start; padding:0 }
+  .view-header > button { margin:0 }
+  .library-actions { align-items:flex-start; flex-wrap:wrap }
+  .tabs { width:100% }
+  .account-stats { width:100%; padding-left:0; margin:0 }
+  .account-profile { gap:12px }
+  .grid { grid-template-columns:1fr }
 }

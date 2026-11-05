@@ -1,6 +1,8 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 // 静态页面目录和本地服务端口；服务只在本机提供访问。
 const root = path.resolve('public');
@@ -10,6 +12,64 @@ const downloadStatePath = path.resolve('download-state.json');
 const DOWNLOAD_CONCURRENCY = 2;
 const MAX_DOWNLOAD_CONCURRENCY = 10;
 const DOWNLOAD_RETRIES = 3;
+const accountsPath = path.resolve('accounts.json');
+const profilesRoot = path.resolve('.chrome-accounts');
+let accounts = [{ id: 'default', name: '默认账号', avatar: '' }];
+let activeAccountId = 'default';
+let activeCdp = 'http://127.0.0.1:9222';
+let accountSwitching = false;
+let accountSave = Promise.resolve();
+
+function saveAccounts() {
+  const payload = JSON.stringify({ activeAccountId, accounts }, null, 2);
+  accountSave = accountSave.catch(() => {}).then(async () => {
+    await fs.writeFile(`${accountsPath}.tmp`, payload, 'utf8');
+    await fs.rename(`${accountsPath}.tmp`, accountsPath);
+  });
+  return accountSave;
+}
+
+async function loadAccounts() {
+  try {
+    const data = JSON.parse(await fs.readFile(accountsPath, 'utf8'));
+    const stored = Array.isArray(data.accounts) ? data.accounts.filter(a => a && (a.id === 'default' || /^[a-f0-9-]{36}$/.test(a.id))) : [];
+    if (!stored.some(a => a.id === 'default')) stored.unshift({ id: 'default', name: '默认账号', avatar: '' });
+    accounts = stored;
+    if (accounts.some(a => a.id === data.activeAccountId)) activeAccountId = data.activeAccountId;
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+async function accountEndpoint(id) {
+  if (id === 'default') return 'http://127.0.0.1:9222';
+  const profile = path.join(profilesRoot, id);
+  const existingEndpoint = async () => {
+    try {
+      const [portText, browserPath] = (await fs.readFile(path.join(profile, 'DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
+      if (!/^\d+$/.test(portText) || !/^\/devtools\/browser\//.test(browserPath)) return null;
+      const endpoint = `http://127.0.0.1:${Number(portText)}`;
+      const version = await (await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1000) })).json();
+      return new URL(version.webSocketDebuggerUrl).pathname === browserPath ? endpoint : null;
+    } catch { return null; }
+  };
+  const existing = await existingEndpoint();
+  if (existing) return existing;
+  const chromeCandidates = [process.env.CHROME_PATH, process.env.CHROME, process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google/Chrome/Application/chrome.exe'), process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google/Chrome/Application/chrome.exe'), process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google/Chrome/Application/chrome.exe')].filter(Boolean);
+  let chrome;
+  for (const candidate of chromeCandidates) { try { await fs.access(candidate); chrome = candidate; break; } catch {} }
+  if (!chrome) throw new Error('未找到 Chrome，请设置 CHROME_PATH');
+  await fs.mkdir(profile, { recursive: true });
+  const child = spawn(chrome, ['--headless=new', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', 'https://www.douyin.com/user/self'], { detached: true, stdio: 'ignore', windowsHide: true });
+  let spawnError;
+  child.on('error', error => { spawnError = error; });
+  child.unref();
+  for (let i = 0; i < 40; i++) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (spawnError) throw spawnError;
+    const endpoint = await existingEndpoint();
+    if (endpoint) return endpoint;
+  }
+  throw new Error('账号浏览器启动失败，请检查 Chrome 和账号目录');
+}
 
 // 统一返回 JSON 或静态资源，并禁止浏览器使用过期的同步结果。
 function send(res, status, body, type = 'application/json; charset=utf-8') {
@@ -1153,7 +1213,7 @@ function startDownloadJob(job) {
 
 // 直接复用已登录的抖音个人页请求详情接口，避免重新加载完整视频页。
 async function fetchVideoDetailFromCurrentPage(id) {
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
   const tab = tabs.find(candidate => candidate.type === 'page' && /douyin\.com\/user\/self/.test(candidate.url));
   if (!tab) throw new Error('未找到可复用的抖音个人页');
   const pageWs = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1258,7 +1318,7 @@ async function fetchVideoDetailFromCurrentPage(id) {
 
 // 在独立的后台标签页打开作品详情，作为直接接口请求失败时的兼容回退路径。
 async function fetchVideoDetailViaNewTab(id) {
-  const version = await (await fetch('http://127.0.0.1:9222/json/version')).json();
+  const version = await (await fetch(`${activeCdp}/json/version`)).json();
   const browser = await connectCdp(version.webSocketDebuggerUrl);
   let targetId;
   let pageWs;
@@ -1269,7 +1329,7 @@ async function fetchVideoDetailViaNewTab(id) {
     }));
     let tab;
     for (let attempt = 0; attempt < 30; attempt += 1) {
-      const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+      const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
       tab = tabs.find(candidate => candidate.id === targetId);
       if (tab) break;
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -1361,7 +1421,7 @@ function mergeVideoDetail(base, detail) {
 async function syncFromChrome(onProgress = () => {}) {
   // 通过 Chrome 调试协议执行页面脚本，同步喜欢和收藏列表。
   // 复用用户当前已登录的抖音页面，服务端不读取或保存 Cookie。
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页。请使用带 --remote-debugging-port=9222 的 Chrome 打开页面。');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1491,7 +1551,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
   const target = new URL(profileUrl);
   const isDouyinHost = hostname => hostname === 'douyin.com' || hostname.endsWith('.douyin.com');
   if (!/^\/user\//.test(target.pathname) || !isDouyinHost(target.hostname)) throw new Error('请输入抖音用户主页链接');
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
   const targetPath = target.pathname.replace(/\/+$/, '');
   let tab = tabs.find(candidate => {
     if (candidate.type !== 'page' || !candidate.url) return false;
@@ -1503,7 +1563,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
   if (!tab) {
     // 输入链接可能在普通 Chrome 窗口中打开，无法出现在 9222 的标签列表里。
     // 此时复用当前调试 Chrome 的登录环境自动创建一个目标页，避免用户必须手动切换窗口。
-    const version = await (await fetch('http://127.0.0.1:9222/json/version')).json();
+    const version = await (await fetch(`${activeCdp}/json/version`)).json();
     const browser = await connectCdp(version.webSocketDebuggerUrl);
     let targetId;
     try {
@@ -1512,7 +1572,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
       try { browser.close(); } catch { /* 忽略浏览器连接关闭异常 */ }
     }
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      const currentTabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+      const currentTabs = await (await fetch(`${activeCdp}/json/list`)).json();
       tab = currentTabs.find(candidate => candidate.type === 'page' && candidate.id === targetId);
       if (tab) break;
       await new Promise(resolve => setTimeout(resolve, 150));
@@ -1610,7 +1670,9 @@ let syncState = { running: false, progress: 0, phase: null, message: '等待同�
 let userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
 
 async function loginPageStatus(refresh = false) {
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const currentAccountId = activeAccountId;
+  const endpoint = activeCdp;
+  const tabs = await (await fetch(`${endpoint}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页，请检查无头 Chrome 是否已启动');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1627,7 +1689,7 @@ async function loginPageStatus(refresh = false) {
           const r = verification.getBoundingClientRect();
           return { status: 'verification', rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
         }
-        const qr = [...document.querySelectorAll('#douyin_login_comp_scan_code_qrcode img')].find(el => el.getClientRects().length);
+        const qr = [...document.querySelectorAll('#douyin_login_comp_scan_code_qrcode img, img[aria-label="二维码"]')].find(el => el.getClientRects().length);
         const src = qr?.getAttribute('src') || '';
         const qrCode = /^data:image\\/png;base64,/.test(src) ? src : '';
         if (!qr) {
@@ -1664,6 +1726,15 @@ async function loginPageStatus(refresh = false) {
         status.profile.avatar = `/api/video/stream?kind=image&url=${encodeURIComponent(avatar)}`;
       } else status.profile.avatar = '';
     }
+    if (status.status === 'logged_in' && status.profile && currentAccountId === activeAccountId) {
+      const account = accounts.find(item => item.id === currentAccountId);
+      if (account && (account.name !== status.profile.nickname || account.avatar !== status.profile.avatar || account.signedOut)) {
+        account.name = status.profile.nickname;
+        account.avatar = status.profile.avatar;
+        account.signedOut = false;
+        await saveAccounts();
+      }
+    }
     if (status.status === 'verification') {
       const clip = { ...status.rect, scale: 1 };
       const screenshot = await cdpCall(ws, 'Page.captureScreenshot', { format: 'png', clip });
@@ -1679,7 +1750,7 @@ async function loginPageStatus(refresh = false) {
 
 async function clickLoginVerification(x, y) {
   if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) throw new Error('无效的验证操作');
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1695,11 +1766,38 @@ async function clickLoginVerification(x, y) {
   } finally { ws.close(); }
 }
 
+async function typeLoginVerification({ text, key, selectAll }) {
+  const allowedKeys = { Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowRight: 39, Home: 36, End: 35, Enter: 13 };
+  if (typeof text === 'string') {
+    if (!text || text.length > 256 || /[\x00-\x1f\x7f]/.test(text)) throw new Error('输入内容无效');
+  } else if (selectAll !== true && !Object.hasOwn(allowedKeys, key)) {
+    throw new Error('不支持的按键');
+  }
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
+  if (!tab) throw new Error('未找到抖音个人页');
+  const ws = await connectCdp(tab.webSocketDebuggerUrl);
+  try {
+    const focused = await cdpCall(ws, 'Runtime.evaluate', {
+      expression: `(() => { const el = document.activeElement; return !!(el?.closest('#uc-second-verify article') && (el.matches('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])') || el.isContentEditable)); })()`,
+      returnByValue: true
+    });
+    if (!focused.result?.value) throw new Error('请先点击验证页面中的输入框');
+    if (typeof text === 'string') {
+      await cdpCall(ws, 'Input.insertText', { text });
+    } else {
+      const params = selectAll ? { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 } : { key, windowsVirtualKeyCode: allowedKeys[key] };
+      await cdpCall(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', ...params });
+      await cdpCall(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', ...params });
+    }
+  } finally { ws.close(); }
+}
+
 async function logoutFromChrome() {
   if (syncState.running || userSyncState.running || [...downloadJobs.values()].some(job => job.status === 'running')) {
     throw new Error('请先等待同步或下载完成，或暂停下载后再退出');
   }
-  const tabs = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1727,6 +1825,8 @@ async function logoutFromChrome() {
       } catch { /* 导航期间执行上下文可能暂时不可用。 */ }
       const status = await loginPageStatus().catch(() => null);
       if (status && ['login', 'confirm_phone', 'verification'].includes(status.status)) {
+        const account = accounts.find(item => item.id === activeAccountId);
+        if (account) { account.signedOut = true; await saveAccounts(); }
         latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
         syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
         userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
@@ -1735,6 +1835,28 @@ async function logoutFromChrome() {
     }
     throw new Error('未能确认退出登录，请重试');
   } finally { ws.close(); }
+}
+
+async function switchAccount(id) {
+  if (accountSwitching) throw new Error('正在切换账号，请稍候');
+  if (!accounts.some(account => account.id === id)) throw new Error('账号不存在');
+  if (id === activeAccountId) return;
+  if (syncState.running || userSyncState.running || detailRequests.size || [...downloadJobs.values()].some(job => job.status === 'running' || job.runningPromise && job.items.some(item => item.status === 'downloading'))) {
+    throw new Error('请先等待同步、作品加载或下载完成，或暂停下载后再切换账号');
+  }
+  accountSwitching = true;
+  try {
+    const endpoint = await accountEndpoint(id);
+    const response = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) throw new Error('无法连接账号浏览器');
+    const previousId = activeAccountId;
+    activeAccountId = id;
+    try { await saveAccounts(); } catch (error) { activeAccountId = previousId; throw error; }
+    activeCdp = endpoint;
+    latestData = { like: [], collect: [], user: [], syncedAt: null, userProfileUrl: '' };
+    syncState = { running: false, progress: 0, phase: null, message: '等待同步', likePages: 0, collectPages: 0, error: null };
+    userSyncState = { running: false, progress: 0, pages: 0, count: 0, message: '等待加载用户作品', profileUrl: '', error: null };
+  } finally { accountSwitching = false; }
 }
 
 // 后台启动同步，避免 HTTP 请求一直等待页面滚动完成。
@@ -1774,6 +1896,26 @@ const server = http.createServer(async (req, res) => {
   try {
     // 启动和查询同步状态的 API；静态文件请求在下面统一处理。
     const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (accountSwitching && requestUrl.pathname.startsWith('/api/') && requestUrl.pathname !== '/api/accounts') return send(res, 409, JSON.stringify({ error: '正在切换账号，请稍候' }));
+    if (requestUrl.pathname === '/api/accounts' && req.method === 'GET') {
+      for (const account of accounts) {
+        if (account.avatar) {
+          try { const value = new URL(account.avatar, 'http://localhost').searchParams.get('url'); if (isDouyinMediaUrl(value)) mediaUrls.set(value, Date.now() + 15 * 60 * 1000); } catch {}
+        }
+      }
+      return send(res, 200, JSON.stringify({ activeAccountId, accounts }));
+    }
+    if (requestUrl.pathname === '/api/accounts' && req.method === 'POST') {
+      const account = { id: randomUUID(), name: '新账号', avatar: '' };
+      accounts.push(account);
+      try { await switchAccount(account.id); } catch (error) { accounts = accounts.filter(item => item.id !== account.id); throw error; }
+      return send(res, 201, JSON.stringify({ activeAccountId, accounts }));
+    }
+    if (requestUrl.pathname === '/api/accounts/switch' && req.method === 'POST') {
+      const { id } = await readJsonBody(req);
+      await switchAccount(id);
+      return send(res, 200, JSON.stringify({ activeAccountId, accounts }));
+    }
     if (requestUrl.pathname === '/api/login/status' && req.method === 'GET') {
       return send(res, 200, JSON.stringify(await loginPageStatus()));
     }
@@ -1786,8 +1928,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 202, JSON.stringify({ status: 'loading' }));
     }
     if (requestUrl.pathname === '/api/login/verification/click' && req.method === 'POST') {
-      const { x, y } = await readJsonBody(req);
+      const { x, y, accountId } = await readJsonBody(req);
+      if (accountId && accountId !== activeAccountId) return send(res, 409, JSON.stringify({ error: '账号已切换，请重新操作' }));
       await clickLoginVerification(x, y);
+      return send(res, 200, JSON.stringify({ ok: true }));
+    }
+    if (requestUrl.pathname === '/api/login/verification/type' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (body.accountId && body.accountId !== activeAccountId) return send(res, 409, JSON.stringify({ error: '账号已切换，请重新操作' }));
+      await typeLoginVerification(body);
       return send(res, 200, JSON.stringify({ ok: true }));
     }
     if (req.url === '/api/sync/start' && req.method === 'POST') {
@@ -1837,6 +1986,7 @@ const server = http.createServer(async (req, res) => {
       if (!items.length) return send(res, 400, JSON.stringify({ error: `没有可下载的${sourceLabels[source]}作品，请先完成同步` }));
       const job = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        accountId: activeAccountId,
         status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         source, quality: body.quality === 'standard' ? 'standard' : 'highest',
         albumMode: body.albumMode === 'flat' ? 'flat' : 'folder',
@@ -1864,6 +2014,7 @@ const server = http.createServer(async (req, res) => {
       const [, id, action] = match;
       const job = downloadJobs.get(id);
       if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
+      if (['resume', 'retry-failed'].includes(action) && (job.accountId || 'default') !== activeAccountId) return send(res, 409, JSON.stringify({ error: '请先切换到创建此任务的账号' }));
       if (action === 'pause') {
         if (job.status === 'running') job.status = 'paused';
       } else if (action === 'resume') {
@@ -1930,5 +2081,7 @@ const server = http.createServer(async (req, res) => {
     send(res, 200, data, type);
   } catch (error) { send(res, 500, JSON.stringify({ error: error.message })); }
 });
+await loadAccounts();
+if (activeAccountId !== 'default') activeCdp = await accountEndpoint(activeAccountId);
 await loadDownloadJobs();
 server.listen(port, () => console.log(`Douyin Library Viewer: http://localhost:${port}`));
