@@ -29,6 +29,7 @@ test('download files stay inside the download directory', async t => {
   const profile = path.join(dir, '.chrome-accounts', '12345678-1234-1234-1234-123456789abc');
   await writeFile(path.join(profile, 'DevToolsActivePort'), `${fakePort}\n/devtools/browser/test\n`);
   await writeFile(path.join(dir, 'accounts.json'), JSON.stringify({ activeAccountId: '12345678-1234-1234-1234-123456789abc', accounts: [{ id: '12345678-1234-1234-1234-123456789abc' }] }));
+  await writeFile(path.join(dir, 'config.json'), JSON.stringify({ password: 'test-password' }));
   const portServer = http.createServer();
   await new Promise(resolve => portServer.listen(0, '127.0.0.1', resolve));
   const port = portServer.address().port;
@@ -38,16 +39,25 @@ test('download files stay inside the download directory', async t => {
   const base = `http://127.0.0.1:${port}`;
   let ready = false;
   for (let i = 0; i < 50; i++) {
-    try { if ((await fetch(`${base}/api/download/files`)).ok) { ready = true; break; } } catch {}
+    try { if ((await fetch(`${base}/access`)).ok) { ready = true; break; } } catch {}
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   assert.ok(ready, 'server starts using the stored browser endpoint');
-  const listing = await (await fetch(`${base}/api/download/files`)).json();
+  assert.equal((await fetch(`${base}/`, { redirect: 'manual' })).status, 303);
+  assert.equal((await fetch(`${base}/api/download/files`)).status, 401);
+  const wrong = await fetch(`${base}/access/login`, { method: 'POST', body: new URLSearchParams({ password: 'wrong' }), redirect: 'manual' });
+  assert.equal(wrong.headers.get('location'), '/access?error=1');
+  const login = await fetch(`${base}/access/login`, { method: 'POST', body: new URLSearchParams({ password: 'test-password' }), redirect: 'manual' });
+  assert.equal(login.status, 303);
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
+  const auth = { headers: { cookie } };
+  const listing = await (await fetch(`${base}/api/download/files`, auth)).json();
   assert.deepEqual(listing.files.map(file => file.path), ['album/test.txt']);
-  const file = await fetch(`${base}/api/download/file?path=${encodeURIComponent('album/test.txt')}`);
+  const file = await fetch(`${base}/api/download/file?path=${encodeURIComponent('album/test.txt')}`, auth);
   assert.equal(file.status, 200);
   assert.equal(await file.text(), 'content');
-  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('../outside.txt')}`)).status, 400);
-  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('partial.part')}`)).status, 400);
-  if (symlinkAvailable) assert.equal((await fetch(`${base}/api/download/file?path=link.txt`)).status, 403);
+  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('../outside.txt')}`, auth)).status, 400);
+  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('partial.part')}`, auth)).status, 400);
+  if (symlinkAvailable) assert.equal((await fetch(`${base}/api/download/file?path=link.txt`, auth)).status, 403);
 });

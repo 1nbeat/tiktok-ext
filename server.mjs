@@ -5,11 +5,13 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { createAccessControl } from './access.mjs';
 
 // 静态页面目录和本地服务端口；服务只在本机提供访问。
 const root = path.resolve('public');
 const port = Number(process.env.PORT || 9001);
 const host = process.env.HOST || '127.0.0.1';
+const access = await createAccessControl(path.resolve(process.env.ACCESS_CONFIG || 'config.json'));
 const downloadRoot = path.resolve('downloads');
 const downloadStatePath = path.resolve('download-state.json');
 const DOWNLOAD_CONCURRENCY = 2;
@@ -144,13 +146,34 @@ async function sendDownloadedFile(res, name) {
   try { await pipeline(createReadStream(filePath), res); } catch { res.destroy(); }
 }
 
-async function cdpCall(ws, method, params = {}) {
+async function cdpCall(ws, method, params = {}, timeoutMs = 20000) {
   // 通过 WebSocket 向 Chrome 发送 CDP 命令，并等待对应响应。
   const id = ++ws.nextId;
   return new Promise((resolve, reject) => {
-    ws.pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
+    const timer = timeoutMs ? setTimeout(() => { ws.pending.delete(id); reject(new Error(`浏览器请求超时：${method}`)); }, timeoutMs) : null;
+    const finish = callback => value => { if (timer) clearTimeout(timer); callback(value); };
+    ws.pending.set(id, { resolve: finish(resolve), reject: finish(reject) });
+    try { ws.send(JSON.stringify({ id, method, params })); }
+    catch (error) { ws.pending.delete(id); if (timer) clearTimeout(timer); reject(error); }
   });
+}
+
+async function evaluateSyncScript(ws, expression) {
+  let timer;
+  let rejectIdle;
+  const idle = new Promise((_, reject) => { rejectIdle = reject; });
+  const reset = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      try { ws.send(JSON.stringify({ id: ++ws.nextId, method: 'Runtime.terminateExecution' })); } catch {}
+      rejectIdle(new Error('浏览器同步超过 60 秒没有进展，请重试；如果持续出现，请检查服务器负载和浏览器状态'));
+    }, 60000);
+  };
+  ws.syncActivity = reset;
+  reset();
+  try {
+    return await Promise.race([cdpCall(ws, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, 0), idle]);
+  } finally { clearTimeout(timer); ws.syncActivity = null; }
 }
 
 // 建立 Chrome DevTools Protocol 连接，同时保存响应事件和待处理请求。
@@ -166,13 +189,18 @@ async function connectCdp(url) {
       ws.pending.delete(message.id);
       message.error ? pending.reject(new Error(message.error.message)) : pending.resolve(message.result);
     } else if (message.method) {
-      ws.events.push(message);
+      if (message.method === 'Network.responseReceived' && /\/aweme\/v1\/web\/(?:aweme\/(favorite|listcollection)|collects\/video\/list)\//.test(message.params?.response?.url || '') && ws.events.length < 1000) ws.events.push(message);
       ws.onEvent?.(message);
     }
   });
+  ws.addEventListener('close', () => {
+    for (const pending of ws.pending.values()) pending.reject(new Error('浏览器连接已关闭'));
+    ws.pending.clear();
+  });
   await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve, { once: true });
-    ws.addEventListener('error', reject, { once: true });
+    const timer = setTimeout(() => { ws.close(); reject(new Error('连接浏览器超时')); }, 10000);
+    ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('无法连接浏览器')); }, { once: true });
   });
   return ws;
 }
@@ -1270,7 +1298,7 @@ function startDownloadJob(job) {
 
 // 直接复用已登录的抖音个人页请求详情接口，避免重新加载完整视频页。
 async function fetchVideoDetailFromCurrentPage(id) {
-  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`, { signal: AbortSignal.timeout(10000) })).json();
   const tab = tabs.find(candidate => candidate.type === 'page' && /douyin\.com\/user\/self/.test(candidate.url));
   if (!tab) throw new Error('未找到可复用的抖音个人页');
   const pageWs = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1478,7 +1506,7 @@ function mergeVideoDetail(base, detail) {
 async function syncFromChrome(onProgress = () => {}) {
   // 通过 Chrome 调试协议执行页面脚本，同步喜欢和收藏列表。
   // 复用用户当前已登录的抖音页面，服务端不读取或保存 Cookie。
-  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`, { signal: AbortSignal.timeout(10000) })).json();
   const tab = tabs.find(t => t.type === 'page' && /douyin\.com\/user\/self/.test(t.url));
   if (!tab) throw new Error('未找到抖音个人页。请使用带 --remote-debugging-port=9222 的 Chrome 打开页面。');
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
@@ -1492,6 +1520,7 @@ async function syncFromChrome(onProgress = () => {}) {
       if (event.method === 'Runtime.consoleAPICalled') {
         const values = event.params.args.map(arg => arg.value);
         if (values[0] === '__DY_SYNC_PROGRESS__') {
+          ws.syncActivity?.();
           const [, phase, current, total, count] = values;
           const ratio = Math.min(1, Math.max(0, Number(current) / Number(total)));
           onProgress({
@@ -1525,7 +1554,8 @@ async function syncFromChrome(onProgress = () => {}) {
     await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 100 * 1024 * 1024, maxResourceBufferSize: 5 * 1024 * 1024 });
     await cdpCall(ws, 'Runtime.enable');
     // 等待页面脚本完成，并取回它记录的 DOM 顺序。
-    const evaluation = await cdpCall(ws, 'Runtime.evaluate', { expression: pageScript, returnByValue: true, awaitPromise: true });
+    const evaluation = await evaluateSyncScript(ws, pageScript);
+    if (evaluation.exceptionDetails) throw new Error(evaluation.exceptionDetails.exception?.description || evaluation.exceptionDetails.text || '同步脚本执行失败');
     const pageResult = evaluation.result?.value || {};
     const domOrder = pageResult.order || { like: [], collect: [] };
     if (pageResult.api?.like && pageResult.api?.collect) {
@@ -1608,7 +1638,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
   const target = new URL(profileUrl);
   const isDouyinHost = hostname => hostname === 'douyin.com' || hostname.endsWith('.douyin.com');
   if (!/^\/user\//.test(target.pathname) || !isDouyinHost(target.hostname)) throw new Error('请输入抖音用户主页链接');
-  const tabs = await (await fetch(`${activeCdp}/json/list`)).json();
+  const tabs = await (await fetch(`${activeCdp}/json/list`, { signal: AbortSignal.timeout(10000) })).json();
   const targetPath = target.pathname.replace(/\/+$/, '');
   let tab = tabs.find(candidate => {
     if (candidate.type !== 'page' || !candidate.url) return false;
@@ -1646,6 +1676,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
       if (event.method === 'Runtime.consoleAPICalled') {
         const values = event.params.args.map(arg => arg.value);
         if (values[0] === '__DY_PROFILE_PROGRESS__') {
+          ws.syncActivity?.();
           const current = Number(values[1]) || 0;
           const total = Number(values[2]) || 240;
           const count = Number(values[3]) || 0;
@@ -1678,7 +1709,7 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
     let lastEvaluationError = null;
     for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
-        evaluation = await cdpCall(ws, 'Runtime.evaluate', { expression: userPageScript, returnByValue: true, awaitPromise: true });
+        evaluation = await evaluateSyncScript(ws, userPageScript);
         const exceptionText = evaluation?.exceptionDetails?.exception?.description
           || evaluation?.exceptionDetails?.text
           || '';
@@ -1963,6 +1994,7 @@ const server = http.createServer(async (req, res) => {
   try {
     // 启动和查询同步状态的 API；静态文件请求在下面统一处理。
     const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (await access(req, res, requestUrl)) return;
     if (accountSwitching && requestUrl.pathname.startsWith('/api/') && requestUrl.pathname !== '/api/accounts') return send(res, 409, JSON.stringify({ error: '正在切换账号，请稍候' }));
     if (requestUrl.pathname === '/api/accounts' && req.method === 'GET') {
       for (const account of accounts) {

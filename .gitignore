@@ -1,9 +1,15 @@
-.chrome-debug-profile/
-.chrome-accounts/
-accounts.json
+# 运行数据和访问配置
+/.chrome-debug-profile/
+/.chrome-accounts/
+/accounts.json
+/config.json
+/config.*.json
+!/config.example.json
+/downloads/
+/download-state.json
+
+# 依赖
 node_modules/
-downloads/
-download-state.json
 
 # IDE 配置
 .idea/
@@ -30,6 +36,7 @@ pnpm-debug.log*
 *.tmp
 *.temp
 *.part
+*.bak
 .DS_Store
 Thumbs.db
 desktop.ini
