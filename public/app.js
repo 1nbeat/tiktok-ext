@@ -11,6 +11,7 @@ function showView(view) {
     if (active) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   });
+  if (view === 'downloads') refreshDownloadedFiles();
 }
 $('.main-nav').addEventListener('click', event => {
   const button = event.target.closest('[data-view]');
@@ -347,6 +348,18 @@ function formatBytes(value) {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
+
+async function refreshDownloadedFiles() {
+  const message = $('#download-files-message');
+  try {
+    const response = await fetch('/api/download/files');
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法读取下载文件');
+    $('#download-files-list').innerHTML = result.files.map(file => `<div class="file-row"><span class="file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span><span class="file-size">${formatBytes(file.size)}</span><a class="file-download" href="/api/download/file?path=${encodeURIComponent(file.path)}" download>下载</a></div>`).join('');
+    message.textContent = result.files.length ? (result.truncated ? '仅显示前 2000 个文件' : '') : '暂无已下载文件';
+  } catch (error) { message.textContent = error.message; }
+}
+$('#download-files-refresh').addEventListener('click', refreshDownloadedFiles);
 
 function formatSpeed(value) {
   // 将下载速度统一显示为每秒字节数、KB、MB 或 GB。

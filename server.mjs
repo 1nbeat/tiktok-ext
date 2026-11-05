@@ -1,12 +1,15 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { createReadStream, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 // 静态页面目录和本地服务端口；服务只在本机提供访问。
 const root = path.resolve('public');
-const port = Number(process.env.PORT || 5173);
+const port = Number(process.env.PORT || 9001);
+const host = process.env.HOST || '127.0.0.1';
 const downloadRoot = path.resolve('downloads');
 const downloadStatePath = path.resolve('download-state.json');
 const DOWNLOAD_CONCURRENCY = 2;
@@ -40,8 +43,13 @@ async function loadAccounts() {
 }
 
 async function accountEndpoint(id) {
-  if (id === 'default') return 'http://127.0.0.1:9222';
-  const profile = path.join(profilesRoot, id);
+  const profile = id === 'default' ? path.resolve('.chrome-debug-profile') : path.join(profilesRoot, id);
+  if (id === 'default') {
+    try {
+      const tabs = await (await fetch('http://127.0.0.1:9222/json/list', { signal: AbortSignal.timeout(1000) })).json();
+      if (tabs.some(tab => tab.type === 'page' && /^https:\/\/www\.douyin\.com\/user\/self(?:[/?#]|$)/.test(tab.url))) return 'http://127.0.0.1:9222';
+    } catch { /* 没有现成的默认浏览器时启动专用会话。 */ }
+  }
   const existingEndpoint = async () => {
     try {
       const [portText, browserPath] = (await fs.readFile(path.join(profile, 'DevToolsActivePort'), 'utf8')).trim().split(/\r?\n/);
@@ -53,20 +61,26 @@ async function accountEndpoint(id) {
   };
   const existing = await existingEndpoint();
   if (existing) return existing;
-  const chromeCandidates = [process.env.CHROME_PATH, process.env.CHROME, process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google/Chrome/Application/chrome.exe'), process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google/Chrome/Application/chrome.exe'), process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google/Chrome/Application/chrome.exe')].filter(Boolean);
+  const platformCandidates = process.platform === 'win32'
+    ? [process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google/Chrome/Application/chrome.exe'), process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google/Chrome/Application/chrome.exe'), process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google/Chrome/Application/chrome.exe')]
+    : ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'];
+  const chromeCandidates = [process.env.CHROME_PATH, process.env.CHROME, ...platformCandidates].filter(Boolean);
   let chrome;
-  for (const candidate of chromeCandidates) { try { await fs.access(candidate); chrome = candidate; break; } catch {} }
+  for (const candidate of chromeCandidates) { try { await fs.access(candidate, process.platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK); chrome = candidate; break; } catch {} }
   if (!chrome) throw new Error('未找到 Chrome，请设置 CHROME_PATH');
   await fs.mkdir(profile, { recursive: true });
   const child = spawn(chrome, ['--headless=new', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', 'https://www.douyin.com/user/self'], { detached: true, stdio: 'ignore', windowsHide: true });
   let spawnError;
+  let exitCode;
   child.on('error', error => { spawnError = error; });
+  child.on('exit', code => { exitCode = code; });
   child.unref();
   for (let i = 0; i < 40; i++) {
     await new Promise(resolve => setTimeout(resolve, 250));
     if (spawnError) throw spawnError;
     const endpoint = await existingEndpoint();
     if (endpoint) return endpoint;
+    if (exitCode != null && exitCode !== 0) throw new Error(`Chrome 启动失败（退出代码 ${exitCode}），请检查浏览器依赖和运行用户`);
   }
   throw new Error('账号浏览器启动失败，请检查 Chrome 和账号目录');
 }
@@ -85,6 +99,49 @@ async function readJsonBody(req) {
     if (body.length > 8 * 1024 * 1024) throw new Error('请求内容过大');
   }
   return body ? JSON.parse(body) : {};
+}
+
+async function listDownloadedFiles() {
+  const files = [];
+  let truncated = false;
+  async function visit(directory, relative = '') {
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT' && !relative) return; throw error; }
+    for (const entry of entries) {
+      if (files.length >= 2000) { truncated = true; return; }
+      const name = path.join(relative, entry.name);
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(fullPath, name);
+      else if (entry.isFile() && !/\.(part|tmp)$/i.test(entry.name)) {
+        const stat = await fs.stat(fullPath);
+        files.push({ path: name.split(path.sep).join('/'), size: stat.size, modifiedAt: stat.mtime.toISOString() });
+      }
+    }
+  }
+  await visit(downloadRoot);
+  files.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+  return { files, truncated };
+}
+
+async function sendDownloadedFile(res, name) {
+  if (typeof name !== 'string' || !name || name.includes('\\') || name.split('/').some(part => !part || part === '.' || part === '..') || /\.(part|tmp)$/i.test(name)) {
+    return send(res, 400, JSON.stringify({ error: '无效的文件路径' }));
+  }
+  let rootPath, filePath, stat;
+  try {
+    rootPath = await fs.realpath(downloadRoot);
+    filePath = await fs.realpath(path.resolve(downloadRoot, ...name.split('/')));
+    if (!filePath.startsWith(rootPath + path.sep)) return send(res, 403, JSON.stringify({ error: '无效的文件路径' }));
+    stat = await fs.stat(filePath);
+    if (!stat.isFile()) return send(res, 404, JSON.stringify({ error: '文件不存在' }));
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return send(res, 404, JSON.stringify({ error: '文件不存在' }));
+    throw error;
+  }
+  const filename = encodeURIComponent(path.basename(filePath)).replace(/['()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': stat.size, 'content-disposition': `attachment; filename="download"; filename*=UTF-8''${filename}`, 'cache-control': 'no-store' });
+  try { await pipeline(createReadStream(filePath), res); } catch { res.destroy(); }
 }
 
 async function cdpCall(ws, method, params = {}) {
@@ -264,7 +321,7 @@ const pageScript = `(async () => {
     channel: 'channel_pc_web',
     publish_video_strategy_type: '2',
     pc_client_type: '1',
-    pc_libra_divert: 'Windows',
+    pc_libra_divert: /Linux/i.test(navigator.userAgent) ? 'Linux' : 'Windows',
     update_version_code: '170400',
     support_h265: '1',
     support_dash: '1',
@@ -280,8 +337,8 @@ const pageScript = `(async () => {
     browser_online: 'true',
     engine_name: 'Blink',
     engine_version: navigator.userAgent.match(/Chrome\\/([\\d.]+)/)?.[1] || '',
-    os_name: 'Windows',
-    os_version: '10',
+    os_name: /Linux/i.test(navigator.userAgent) ? 'Linux' : 'Windows',
+    os_version: /Linux/i.test(navigator.userAgent) ? '' : '10',
     cpu_core_num: String(navigator.hardwareConcurrency || 4),
     device_memory: String(navigator.deviceMemory || 8),
     platform: 'PC',
@@ -1230,7 +1287,7 @@ async function fetchVideoDetailFromCurrentPage(id) {
         publish_video_strategy_type: '2',
         update_version_code: '170400',
         pc_client_type: '1',
-        pc_libra_divert: 'Windows',
+        pc_libra_divert: /Linux/i.test(navigator.userAgent) ? 'Linux' : 'Windows',
         support_h265: '1',
         support_dash: '1',
         cpu_core_num: String(navigator.hardwareConcurrency || 4),
@@ -1246,8 +1303,8 @@ async function fetchVideoDetailFromCurrentPage(id) {
         browser_online: 'true',
         engine_name: 'Blink',
         engine_version: browserVersion,
-        os_name: 'Windows',
-        os_version: '10',
+        os_name: /Linux/i.test(navigator.userAgent) ? 'Linux' : 'Windows',
+        os_version: /Linux/i.test(navigator.userAgent) ? '' : '10',
         device_memory: String(navigator.deviceMemory || 8),
         platform: 'PC',
         aweme_id: awemeId
@@ -1756,13 +1813,23 @@ async function clickLoginVerification(x, y) {
   const ws = await connectCdp(tab.webSocketDebuggerUrl);
   try {
     const result = await cdpCall(ws, 'Runtime.evaluate', {
-      expression: `(() => { const el = document.querySelector('#uc-second-verify article'); if (!el || !el.getClientRects().length) return null; const r = el.getBoundingClientRect(); const x = r.x + r.width * ${x}, y = r.y + r.height * ${y}; return document.elementFromPoint(x, y)?.closest('#uc-second-verify') ? { x, y } : null; })()`,
+      expression: `(() => {
+        const panel = document.querySelector('#uc-second-verify article');
+        if (!panel || !panel.getClientRects().length) return false;
+        const r = panel.getBoundingClientRect();
+        const target = document.elementFromPoint(r.x + r.width * ${x}, r.y + r.height * ${y});
+        if (!target || !panel.contains(target)) return false;
+        const input = target.closest('input, textarea, [contenteditable="true"]');
+        if (input) input.focus();
+        let clickable = target;
+        while (clickable && typeof clickable.click !== 'function') clickable = clickable.parentElement;
+        if (!clickable || !panel.contains(clickable)) return false;
+        clickable.click();
+        return true;
+      })()`,
       returnByValue: true
     });
-    const point = result.result?.value;
-    if (!point) throw new Error('验证页面已变化，请重试');
-    await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
-    await cdpCall(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
+    if (!result.result?.value) throw new Error('验证页面已变化，请重试');
   } finally { ws.close(); }
 }
 
@@ -1998,6 +2065,12 @@ const server = http.createServer(async (req, res) => {
       startDownloadJob(job);
       return send(res, 202, JSON.stringify(publicDownloadJob(job)));
     }
+    if (requestUrl.pathname === '/api/download/files' && req.method === 'GET') {
+      return send(res, 200, JSON.stringify(await listDownloadedFiles()));
+    }
+    if (requestUrl.pathname === '/api/download/file' && req.method === 'GET') {
+      return sendDownloadedFile(res, requestUrl.searchParams.get('path'));
+    }
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'GET') {
       const jobs = [...downloadJobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
       return send(res, 200, JSON.stringify(jobs.slice(0, 20).map(publicDownloadJob)));
@@ -2082,6 +2155,6 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { send(res, 500, JSON.stringify({ error: error.message })); }
 });
 await loadAccounts();
-if (activeAccountId !== 'default') activeCdp = await accountEndpoint(activeAccountId);
+activeCdp = await accountEndpoint(activeAccountId);
 await loadDownloadJobs();
-server.listen(port, () => console.log(`Douyin Library Viewer: http://localhost:${port}`));
+server.listen(port, host, () => console.log(`Douyin Library Viewer: http://${host}:${port}`));

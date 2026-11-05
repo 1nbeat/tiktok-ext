@@ -1,0 +1,53 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const serverPath = fileURLToPath(new URL('../server.mjs', import.meta.url));
+
+test('download files stay inside the download directory', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'douyin-server-test-'));
+  const downloads = path.join(dir, 'downloads');
+  await mkdir(path.join(downloads, 'album'), { recursive: true });
+  await mkdir(path.join(dir, '.chrome-accounts', '12345678-1234-1234-1234-123456789abc'), { recursive: true });
+  await writeFile(path.join(downloads, 'album', 'test.txt'), 'content');
+  await writeFile(path.join(downloads, 'partial.part'), 'unfinished');
+  await writeFile(path.join(dir, 'outside.txt'), 'secret');
+  let symlinkAvailable = true;
+  try { await symlink(path.join(dir, 'outside.txt'), path.join(downloads, 'link.txt')); } catch { symlinkAvailable = false; }
+  const fakeChrome = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ webSocketDebuggerUrl: 'ws://127.0.0.1/devtools/browser/test' }));
+  });
+  await new Promise(resolve => fakeChrome.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => fakeChrome.close(resolve)));
+  const fakePort = fakeChrome.address().port;
+  const profile = path.join(dir, '.chrome-accounts', '12345678-1234-1234-1234-123456789abc');
+  await writeFile(path.join(profile, 'DevToolsActivePort'), `${fakePort}\n/devtools/browser/test\n`);
+  await writeFile(path.join(dir, 'accounts.json'), JSON.stringify({ activeAccountId: '12345678-1234-1234-1234-123456789abc', accounts: [{ id: '12345678-1234-1234-1234-123456789abc' }] }));
+  const portServer = http.createServer();
+  await new Promise(resolve => portServer.listen(0, '127.0.0.1', resolve));
+  const port = portServer.address().port;
+  await new Promise(resolve => portServer.close(resolve));
+  const child = spawn(process.execPath, [serverPath], { cwd: dir, env: { ...process.env, HOST: '127.0.0.1', PORT: String(port) }, stdio: 'ignore' });
+  t.after(async () => { if (child.exitCode === null) { const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await exited; } await rm(dir, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${port}`;
+  let ready = false;
+  for (let i = 0; i < 50; i++) {
+    try { if ((await fetch(`${base}/api/download/files`)).ok) { ready = true; break; } } catch {}
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(ready, 'server starts using the stored browser endpoint');
+  const listing = await (await fetch(`${base}/api/download/files`)).json();
+  assert.deepEqual(listing.files.map(file => file.path), ['album/test.txt']);
+  const file = await fetch(`${base}/api/download/file?path=${encodeURIComponent('album/test.txt')}`);
+  assert.equal(file.status, 200);
+  assert.equal(await file.text(), 'content');
+  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('../outside.txt')}`)).status, 400);
+  assert.equal((await fetch(`${base}/api/download/file?path=${encodeURIComponent('partial.part')}`)).status, 400);
+  if (symlinkAvailable) assert.equal((await fetch(`${base}/api/download/file?path=link.txt`)).status, 403);
+});

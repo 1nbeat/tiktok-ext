@@ -1154,6 +1154,13 @@ h1 {
 .account-row-name { flex:1; min-width:0; overflow-wrap:anywhere; font-size:14px; font-weight:600 }
 .account-current { color:#398568; font-size:12px }
 .account-switch { padding:7px 13px; font-size:13px }
+.files-list { border-top:1px solid #e4e7e9 }
+.file-row { display:flex; align-items:center; gap:14px; min-width:0; padding:12px 0; border-bottom:1px solid #e4e7e9; font-size:13px }
+.file-name { flex:1; min-width:0; overflow-wrap:anywhere }
+.file-size { flex:none; color:#7b858e }
+.file-download { flex:none; color:#ce3151; text-decoration:none }
+.file-download:hover { text-decoration:underline }
+.files-message { color:#7b858e; font-size:13px }
 @media(max-width:640px) {
   .account-profile { flex-wrap:wrap }
   .account-stats { width:100%; padding-left:62px; gap:16px }
