@@ -30,10 +30,13 @@ function renderSidebarAccount(profile, status) {
 }
 
 function renderAccountProfile(profile, status) {
-  renderSidebarAccount(profile, status);
+  const loading = status === 'loading' || (status === 'logged_in' && !profile);
+  renderSidebarAccount(profile, loading ? 'loading' : status);
   $('#account-profile').hidden = !profile;
-  $('#account-empty').hidden = status === 'logged_in';
-  $('#login-open').hidden = status === 'logged_in';
+  $('#account-loading').hidden = !loading;
+  $('#account-loading strong').textContent = '正在加载账号信息';
+  $('#account-empty').hidden = loading || status === 'logged_in';
+  $('#login-open').hidden = loading || status === 'logged_in';
   if (!profile) return;
   $('#account-name').textContent = profile.nickname;
   $('#account-signature').textContent = profile.signature || '暂无签名';
@@ -69,10 +72,7 @@ async function resetAccountView() {
   state.like = []; state.collect = []; state.user = []; state.page = 1;
   libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
   $('#sync-status').hidden = true;
-  $('#account-profile').hidden = true;
-  $('#account-empty').hidden = false;
-  $('#login-open').hidden = false;
-  renderSidebarAccount(null, 'loading');
+  renderAccountProfile(null, 'loading');
   render();
   await loadLibrary();
   await refreshAccounts();
@@ -235,6 +235,8 @@ async function pollLogin() {
   } catch (error) {
     $('#login-status').textContent = error.message;
     $('#sidebar-account-status').textContent = '连接失败';
+    if (!$('#account-loading').hidden) $('#account-loading strong').textContent = '账号信息加载失败，正在重试';
+    nextDelay = 5000;
     $('#login-qr').hidden = true;
     $('#login-verification').hidden = true;
   } finally {
@@ -259,10 +261,7 @@ $('#account-logout').addEventListener('click', async () => {
     if (!response.ok) throw new Error(result.error || '退出登录失败');
     state.like = []; state.collect = []; state.user = []; state.page = 1;
     libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
-    $('#account-profile').hidden = true;
-    renderSidebarAccount(null, 'login');
-    $('#account-empty').hidden = false;
-    $('#login-open').hidden = false;
+    renderAccountProfile(null, 'login');
     $('#sync-status').hidden = true;
     render();
     refreshAccounts().catch(() => {});
@@ -560,7 +559,7 @@ async function pollDownloadJob(id) {
   // 任务运行期间定时拉取服务端状态，完成后停止轮询。
   clearTimeout(downloadPollTimer);
   try {
-    const response = await fetch(`/api/download/jobs/${encodeURIComponent(id)}`);
+    const response = await fetch(`/api/download/jobs/${encodeURIComponent(id)}?summary=1`);
     const job = await response.json();
     if (!response.ok) throw new Error(job.error || '获取下载任务失败');
     renderDownloadJob(job);
@@ -583,7 +582,7 @@ async function createDownloadJob({ detail } = {}) {
   const concurrency = Math.min(10, Math.max(1, Number($('#download-concurrency').value) || 2));
   const albumMode = $('#download-album-mode').value === 'flat' ? 'flat' : 'folder';
   clearDismissedDownloadJob();
-  const response = await fetch('/api/download/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, id: detail?.id, quality, concurrency, albumMode, skipExisting: true }) });
+  const response = await fetch('/api/download/jobs?summary=1', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source, id: detail?.id, quality, concurrency, albumMode, skipExisting: true }) });
   const job = await response.json();
   if (!response.ok) throw new Error(job.error || '创建下载任务失败');
   renderDownloadJob(job);
@@ -641,7 +640,7 @@ function closeDownloadConfirmation(confirmed) {
 async function downloadJobAction(action) {
   // 统一处理暂停、继续、重试和取消等后台任务操作。
   if (!downloadJob) return;
-  const response = await fetch(`/api/download/jobs/${encodeURIComponent(downloadJob.id)}/${action}`, { method: 'POST' });
+  const response = await fetch(`/api/download/jobs/${encodeURIComponent(downloadJob.id)}/${action}?summary=1`, { method: 'POST' });
   const job = await response.json();
   if (!response.ok) throw new Error(job.error || '下载任务操作失败');
   renderDownloadJob(job);
@@ -1418,7 +1417,7 @@ async function restoreLatest() {
       $('#progress-track').hidden = false;
       pollUserSync();
     }
-    const jobs = await (await fetch('/api/download/jobs')).json();
+    const jobs = await (await fetch('/api/download/jobs?summary=1')).json();
     const active = jobs.find(job => ['running', 'pending', 'paused', 'failed', 'completed_with_errors'].includes(job.status) && !isDismissedDownloadJob(job));
     if (active) {
       renderDownloadJob(active);

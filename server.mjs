@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { createReadStream, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createAccessControl } from './access.mjs';
@@ -831,11 +832,13 @@ function detailFromAweme(item, fallbackId) {
 }
 
 const detailRequests = new Map();
+let detailFallbackQueue = Promise.resolve();
 
 // 播放地址只在短时间内有效，保存到内存中供本地媒体代理校验使用。
 const mediaUrls = new Map();
 
 const downloadJobs = new Map();
+const downloadProgressSavedAt = new WeakMap();
 let downloadStateWrite = Promise.resolve();
 let downloadStateTimer = null;
 let downloadStateResolvers = [];
@@ -859,7 +862,7 @@ function queueDownloadStateSave() {
   return promise;
 }
 
-function publicDownloadJob(job) {
+function publicDownloadJob(job, { includeItems = true } = {}) {
   // 只向前端暴露任务进度字段，隐藏运行时 Promise 和媒体地址缓存。
   const exposeItem = ({ rateAt, rateBytes, playUrl, qualities, images, imageMedia, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
   return {
@@ -886,7 +889,7 @@ function publicDownloadJob(job) {
     current: (() => { const item = job.items.find(candidate => candidate.status === 'downloading'); return item ? exposeItem(item) : null; })(),
     activeItems: job.items.filter(item => item.status === 'downloading').map(exposeItem),
     error: job.error || null,
-    items: job.items.map(exposeItem)
+    ...(includeItems ? { items: job.items.map(exposeItem) } : {})
   };
 }
 
@@ -976,23 +979,20 @@ async function proxyMedia(req, res, value, { download = false, id = '', kind = '
     responseHeaders['content-disposition'] = `attachment; filename="douyin-${id || 'media'}${suffix}.${extension}"`;
   }
   res.writeHead(upstream.status, responseHeaders);
-  if (req.method === 'HEAD') return res.end();
+  if (req.method === 'HEAD') { await upstream.body?.cancel(); return res.end(); }
   if (!upstream.body) return res.end();
-  const reader = upstream.body.getReader();
   try {
-    while (true) {
-      const { done, value: chunk } = await reader.read();
-      if (done) break;
-      if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
-    }
-  } finally {
-    reader.releaseLock();
-    res.end();
-  }
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch { res.destroy(); }
 }
 
-function updateDownloadJob(job) {
+function updateDownloadJob(job, { progress = false } = {}) {
   job.updatedAt = new Date().toISOString();
+  if (progress) {
+    const now = Date.now();
+    if (now - (downloadProgressSavedAt.get(job) || 0) < 2000) return;
+    downloadProgressSavedAt.set(job, now);
+  }
   queueDownloadStateSave();
 }
 
@@ -1151,9 +1151,10 @@ async function downloadJobItem(job, item) {
           if (done) break;
           await handle.write(value);
           updateDownloadRate(item, value.byteLength);
-          updateDownloadJob(job);
+          updateDownloadJob(job, { progress: true });
         }
       } finally {
+        if (inactive()) await reader.cancel().catch(() => {});
         reader.releaseLock();
         await handle.close();
       }
@@ -1266,7 +1267,7 @@ async function downloadImageAlbumItem(job, item) {
             if (done) break;
             await handle.write(value);
             updateDownloadRate(item, value.byteLength);
-            updateDownloadJob(job);
+            updateDownloadJob(job, { progress: true });
           }
         } finally {
           if (inactive()) await reader.cancel().catch(() => {});
@@ -1517,7 +1518,9 @@ async function fetchVideoDetail(id) {
     return await fetchVideoDetailFromCurrentPage(id);
   } catch (error) {
     console.warn(`直接请求作品 ${id} 详情失败，切换到详情页回退：${error.message}`);
-    return fetchVideoDetailViaNewTab(id);
+    const request = detailFallbackQueue.then(() => fetchVideoDetailViaNewTab(id));
+    detailFallbackQueue = request.catch(() => {});
+    return request;
   }
 }
 
@@ -1648,17 +1651,16 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
       return isDouyinHost(current.hostname) && current.pathname.replace(/\/+$/, '') === targetPath;
     } catch { return false; }
   });
+  let browser;
+  let targetId;
+  let ws;
+  try {
   if (!tab) {
     // 输入链接可能在普通 Chrome 窗口中打开，无法出现在 9222 的标签列表里。
     // 此时复用当前调试 Chrome 的登录环境自动创建一个目标页，避免用户必须手动切换窗口。
     const version = await (await fetch(`${activeCdp}/json/version`)).json();
-    const browser = await connectCdp(version.webSocketDebuggerUrl);
-    let targetId;
-    try {
-      ({ targetId } = await cdpCall(browser, 'Target.createTarget', { url: target.href, background: false }));
-    } finally {
-      try { browser.close(); } catch { /* 忽略浏览器连接关闭异常 */ }
-    }
+    browser = await connectCdp(version.webSocketDebuggerUrl);
+    ({ targetId } = await cdpCall(browser, 'Target.createTarget', { url: target.href, background: false }));
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const currentTabs = await (await fetch(`${activeCdp}/json/list`)).json();
       tab = currentTabs.find(candidate => candidate.type === 'page' && candidate.id === targetId);
@@ -1667,10 +1669,9 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
     }
   }
   if (!tab) throw new Error('无法在调试 Chrome 中打开该用户主页，请确认 9222 端口可用。');
-  const ws = await connectCdp(tab.webSocketDebuggerUrl);
-  try {
+  ws = await connectCdp(tab.webSocketDebuggerUrl);
     ws.responseUrls = new Map();
-    ws.responseBodies = new Map();
+    ws.responseItems = new Map();
     ws.responseBodyPromises = [];
     ws.skipResponseBodies = new Set();
     ws.onEvent = event => {
@@ -1696,13 +1697,16 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
         const bodyPromise = cdpCall(ws, 'Network.getResponseBody', { requestId }).then(body => {
           try {
             const data = JSON.parse(body.body);
-            if (Array.isArray(data?.aweme_list)) ws.responseBodies.set(requestId, { url: ws.responseUrls.get(requestId), data });
+            for (const item of data?.aweme_list || []) {
+              const normalized = itemFromAweme(item, 'user');
+              if (/^\d+$/.test(normalized.id) && !ws.responseItems.has(normalized.id)) ws.responseItems.set(normalized.id, normalized);
+            }
           } catch { /* 忽略已经被 Chrome 回收或不是 JSON 的响应 */ }
         }).catch(() => {});
         ws.responseBodyPromises.push(bodyPromise);
       }
     };
-    await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 100 * 1024 * 1024, maxResourceBufferSize: 5 * 1024 * 1024 });
+    await cdpCall(ws, 'Network.enable', { maxTotalBufferSize: 16 * 1024 * 1024, maxResourceBufferSize: 5 * 1024 * 1024 });
     await cdpCall(ws, 'Runtime.enable');
     // 新建标签页仍处于导航阶段时，Runtime.evaluate 可能因为执行上下文被替换而失败。
     // 等待短暂稳定并重试，避免用户第一次加载必须手动再点一次。
@@ -1741,16 +1745,17 @@ async function syncUserFromChrome(profileUrl, onProgress = () => {}) {
     for (const item of pageResult.items || []) {
       if (item?.id && !items.has(item.id)) items.set(item.id, { ...item, source: 'user' });
     }
-    for (const { data } of ws.responseBodies.values()) {
-      for (const item of data.aweme_list || []) {
-        const normalized = itemFromAweme(item, 'user');
-        if (/^\d+$/.test(normalized.id) && !items.has(normalized.id)) items.set(normalized.id, normalized);
-      }
-    }
+    for (const [id, item] of ws.responseItems) if (!items.has(id)) items.set(id, item);
     if (!items.size) throw new Error('没有从该用户主页获取到作品，请确认页面已加载完成且账号可以访问作品列表。');
     onProgress({ progress: 100, pages: 0, count: items.size, message: `用户作品加载完成：${items.size} 条` });
     return { items: [...items.values()], profileUrl: target.href, syncedAt: new Date().toISOString() };
-  } finally { ws.close(); }
+  } finally {
+    ws?.close();
+    if (targetId && browser) {
+      try { await cdpCall(browser, 'Target.closeTarget', { targetId }, 3000); } catch { /* 标签页可能已关闭。 */ }
+    }
+    browser?.close();
+  }
 }
 
 // 指定用户作品暂存在内存；喜欢和收藏保存在 SQLite 中。
@@ -2247,7 +2252,7 @@ const server = http.createServer(async (req, res) => {
       downloadJobs.set(job.id, job);
       await queueDownloadStateSave();
       startDownloadJob(job);
-      return send(res, 202, JSON.stringify(publicDownloadJob(job)));
+      return send(res, 202, JSON.stringify(publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' })));
     }
     if (requestUrl.pathname === '/api/download/files' && req.method === 'GET') {
       return send(res, 200, JSON.stringify(await listDownloadedFiles()));
@@ -2257,13 +2262,13 @@ const server = http.createServer(async (req, res) => {
     }
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'GET') {
       const jobs = [...downloadJobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-      return send(res, 200, JSON.stringify(jobs.slice(0, 20).map(publicDownloadJob)));
+      return send(res, 200, JSON.stringify(jobs.slice(0, 20).map(job => publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' }))));
     }
     if (requestUrl.pathname.startsWith('/api/download/jobs/') && req.method === 'GET') {
       const id = requestUrl.pathname.split('/').pop();
       const job = downloadJobs.get(id);
       if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
-      return send(res, 200, JSON.stringify(publicDownloadJob(job)));
+      return send(res, 200, JSON.stringify(publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' })));
     }
     if (requestUrl.pathname.startsWith('/api/download/jobs/') && req.method === 'POST') {
       const match = requestUrl.pathname.match(/^\/api\/download\/jobs\/([^/]+)\/(pause|resume|cancel|retry-failed)$/);
@@ -2289,7 +2294,7 @@ const server = http.createServer(async (req, res) => {
         startDownloadJob(job);
       }
       updateDownloadJob(job);
-      return send(res, 200, JSON.stringify(publicDownloadJob(job)));
+      return send(res, 200, JSON.stringify(publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' })));
     }
     if (requestUrl.pathname === '/api/video/stream' && (req.method === 'GET' || req.method === 'HEAD')) {
       const streamId = requestUrl.searchParams.get('id') || '';
