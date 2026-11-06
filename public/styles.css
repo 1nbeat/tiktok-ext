@@ -1113,6 +1113,7 @@ h1 {
 .download-confirm-content {
   padding:34px 32px 28px
 }
+.action-confirm-modal #action-confirm-message { overflow-wrap:anywhere; white-space:pre-wrap }
 .login-modal #login-qr {
   display:block;
   width:200px;
@@ -1160,6 +1161,10 @@ h1 {
 .file-size { flex:none; color:#7b858e }
 .file-download { flex:none; color:#ce3151; text-decoration:none }
 .file-download:hover { text-decoration:underline }
+.file-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end }
+.file-delete { flex:none; padding:0; border:0; background:none; color:#ce3151; font:inherit; cursor:pointer }
+.file-delete:hover { text-decoration:underline }
+.file-delete:disabled { opacity:.5; cursor:default }
 .files-message { color:#7b858e; font-size:13px }
 @media(max-width:640px) {
   .account-profile { flex-wrap:wrap }
@@ -1816,6 +1821,7 @@ h1 {
 .sidebar-account-arrow { color:#aab0b5; font-size:20px }
 .shell { width:100%; max-width:1500px; min-width:0; margin:0 auto; padding:42px 44px 72px }
 .workspace-view[hidden] { display:none }
+#work-content[hidden], .tabs[hidden] { display:none }
 .view-header { min-height:104px; display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding-bottom:27px; border-bottom:1px solid #e4e7e9 }
 .view-eyebrow { color:#b05b6d; font-size:10px; font-weight:700; letter-spacing:0 }
 .view-header h1 { margin:4px 0 0; color:#20242a; font-size:26px; line-height:1.25 }
@@ -1854,8 +1860,8 @@ h1 {
   .sidebar { padding:12px 14px 0 }
   .brand { padding-bottom:11px }
   .brand-mark { width:32px; height:32px; font-size:17px }
-  .main-nav { justify-content:space-between }
-  .nav-item { flex:1; min-width:0; padding:0 6px; font-size:13px }
+  .main-nav { overflow-x:auto }
+  .nav-item { flex:0 0 auto; min-width:0; padding:0 9px; font-size:13px; gap:5px; white-space:nowrap }
   .shell { padding:24px 16px 100px }
   .view-header { flex-direction:column; gap:14px; padding-bottom:20px }
   .view-header h1 { font-size:23px }

@@ -2,8 +2,29 @@
 const PAGE_SIZE = 24;
 const $ = selector => document.querySelector(selector);
 
+let actionConfirmResolver = null;
+function confirmAction(title, message) {
+  const modal = $('#action-confirm-modal');
+  if (actionConfirmResolver || modal.open) return Promise.resolve(false);
+  $('#action-confirm-title').textContent = title;
+  $('#action-confirm-message').textContent = message;
+  modal.returnValue = '';
+  return new Promise(resolve => {
+    actionConfirmResolver = resolve;
+    modal.showModal();
+  });
+}
+$('#action-confirm-accept').addEventListener('click', () => $('#action-confirm-modal').close('confirm'));
+$('#action-confirm-cancel').addEventListener('click', () => $('#action-confirm-modal').close());
+$('#action-confirm-close').addEventListener('click', () => $('#action-confirm-modal').close());
+$('#action-confirm-modal').addEventListener('close', () => {
+  const resolve = actionConfirmResolver;
+  actionConfirmResolver = null;
+  resolve?.($('#action-confirm-modal').returnValue === 'confirm');
+});
+
 function showView(view) {
-  if (!['library', 'downloads', 'account'].includes(view)) return;
+  if (!['library', 'user', 'downloads', 'account'].includes(view)) return;
   document.querySelectorAll('.workspace-view').forEach(section => { section.hidden = section.id !== `view-${view}`; });
   document.querySelectorAll('.nav-item').forEach(button => {
     const active = button.dataset.view === view;
@@ -11,6 +32,23 @@ function showView(view) {
     if (active) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   });
+  const workView = view === 'library' || view === 'user';
+  $('#work-content').hidden = !workView;
+  if (workView) {
+    const source = view === 'user' ? 'user' : lastLibrarySource;
+    $('.tabs').hidden = view === 'user';
+    $('#work-title').textContent = view === 'user' ? '用户作品列表' : '我的作品集';
+    if (state.source !== source) {
+      const previousView = state.source === 'user' ? 'user' : 'library';
+      workFilters[previousView] = { query: state.query, sort: state.sort, page: state.page };
+      state.source = source;
+      Object.assign(state, workFilters[view]);
+      $('#search').value = state.query;
+      $('#sort').value = state.sort;
+      render();
+      if (source !== 'user') loadLibrary();
+    }
+  }
   if (view === 'downloads') refreshDownloadedFiles();
 }
 $('.main-nav').addEventListener('click', event => {
@@ -72,6 +110,7 @@ async function resetAccountView() {
   state.like = []; state.collect = []; state.user = []; state.page = 1;
   libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
   $('#sync-status').hidden = true;
+  $('#user-sync-status').hidden = true;
   renderAccountProfile(null, 'loading');
   render();
   await loadLibrary();
@@ -141,7 +180,9 @@ $('#account-list').addEventListener('click', event => {
 });
 
 async function deleteAccount(id) {
-  if (switchingAccount || loggingOut || addingAccount || !confirm('删除此账号及其本地同步记录和登录信息？已下载文件会保留。')) return;
+  if (switchingAccount || loggingOut || addingAccount) return;
+  if (!await confirmAction('删除账号', '删除此账号及其本地同步记录和登录信息？已下载文件会保留。')) return;
+  if (switchingAccount || loggingOut || addingAccount) return;
   switchingAccount = true;
   accountGeneration++;
   clearTimeout(loginPollTimer);
@@ -263,6 +304,7 @@ $('#account-logout').addEventListener('click', async () => {
     libraryCounts = { like: 0, collect: 0 }; libraryStats = { like: null, collect: null }; libraryTotal = 0; lastSyncVersion = -1;
     renderAccountProfile(null, 'login');
     $('#sync-status').hidden = true;
+    $('#user-sync-status').hidden = true;
     render();
     refreshAccounts().catch(() => {});
   } catch (cause) {
@@ -334,6 +376,11 @@ $('#login-refresh').addEventListener('click', async () => {
 });
 // saved 表示保持抖音原页面顺序，其余选项是用户主动选择的排序方式。
 const state = { source: 'like', like: [], collect: [], user: [], query: '', sort: 'saved', page: 1 };
+let lastLibrarySource = 'like';
+const workFilters = {
+  library: { query: '', sort: 'saved', page: 1 },
+  user: { query: '', sort: 'saved', page: 1 }
+};
 let libraryRequest = 0;
 let libraryCounts = { like: 0, collect: 0 };
 let libraryStats = { like: null, collect: null };
@@ -464,7 +511,6 @@ function render() {
   state.page = Math.min(state.page, totalPages);
   $('#like-count').textContent = libraryCounts.like;
   $('#collect-count').textContent = libraryCounts.collect;
-  $('#user-count').textContent = state.user.length;
   const sourceItems = Array.isArray(state[state.source]) ? state[state.source] : [];
   const workCount = state.source === 'user' ? sourceItems.length : libraryCounts[state.source];
   const checkpoint = libraryStats[state.source]?.checkpoint;
@@ -493,17 +539,55 @@ function formatBytes(value) {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
+let downloadFilesRequestId = 0;
+let downloadFilesRefreshTimer = null;
+let downloadFilesVersion = null;
 async function refreshDownloadedFiles() {
+  const requestId = ++downloadFilesRequestId;
   const message = $('#download-files-message');
   try {
     const response = await fetch('/api/download/files');
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '无法读取下载文件');
-    $('#download-files-list').innerHTML = result.files.map(file => `<div class="file-row"><span class="file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span><span class="file-size">${formatBytes(file.size)}</span><a class="file-download" href="/api/download/file?path=${encodeURIComponent(file.path)}" download>下载</a></div>`).join('');
+    if (requestId !== downloadFilesRequestId) return;
+    $('#download-files-list').innerHTML = result.files.map(file => `<div class="file-row"><span class="file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span><span class="file-size">${formatBytes(file.size)}</span><a class="file-download" href="/api/download/file?path=${encodeURIComponent(file.path)}" download>下载</a><button type="button" class="file-delete" data-file-path="${escapeHtml(file.path)}" aria-label="删除 ${escapeHtml(file.path)}">删除</button></div>`).join('');
+    $('#download-files-delete-all').disabled = !result.files.length;
     message.textContent = result.files.length ? (result.truncated ? '仅显示前 2000 个文件' : '') : '暂无已下载文件';
-  } catch (error) { message.textContent = error.message; }
+  } catch (error) { if (requestId === downloadFilesRequestId) message.textContent = error.message; }
 }
 $('#download-files-refresh').addEventListener('click', refreshDownloadedFiles);
+
+let deletingFiles = false;
+async function deleteDownloadedFiles(path) {
+  if (deletingFiles) return;
+  const all = path == null;
+  const prompt = all ? '删除所有已下载文件？未完成的下载文件会保留。' : `删除已下载文件“${path}”？`;
+  if (!await confirmAction(all ? '删除全部已下载文件' : '删除已下载文件', prompt)) return;
+  if (deletingFiles) return;
+  deletingFiles = true;
+  $('#download-files-refresh').disabled = true;
+  $('#download-files-delete-all').disabled = true;
+  document.querySelectorAll('.file-delete').forEach(button => { button.disabled = true; });
+  try {
+    const response = await fetch('/api/download/files', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(all ? { all: true } : { path }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '删除文件失败');
+    await refreshDownloadedFiles();
+    $('#download-files-message').textContent = `已删除 ${result.deleted} 个文件`;
+  } catch (error) {
+    await refreshDownloadedFiles();
+    $('#download-files-message').textContent = error.message;
+  } finally {
+    deletingFiles = false;
+    $('#download-files-refresh').disabled = false;
+    document.querySelectorAll('.file-delete').forEach(button => { button.disabled = false; });
+  }
+}
+$('#download-files-delete-all').addEventListener('click', () => deleteDownloadedFiles());
+$('#download-files-list').addEventListener('click', event => {
+  const button = event.target.closest('[data-file-path]');
+  if (button) deleteDownloadedFiles(button.dataset.filePath);
+});
 
 function formatSpeed(value) {
   // 将下载速度统一显示为每秒字节数、KB、MB 或 GB。
@@ -526,6 +610,14 @@ function renderDownloadJob(job) {
   $('#download-empty').hidden = !panel.hidden;
   $('#nav-download-indicator').hidden = !job || !['running', 'pending'].includes(job.status);
   if (!job) return;
+  const fileVersion = Number(job.fileVersion) || 0;
+  if (downloadFilesVersion?.id === job.id && downloadFilesVersion.version !== fileVersion && !$('#view-downloads').hidden && !deletingFiles && !downloadFilesRefreshTimer) {
+    downloadFilesRefreshTimer = setTimeout(() => {
+      downloadFilesRefreshTimer = null;
+      if (!$('#view-downloads').hidden && !deletingFiles) refreshDownloadedFiles();
+    }, 300);
+  }
+  downloadFilesVersion = { id: job.id, version: fileVersion };
   const finished = Number(job.completed || 0) + Number(job.skipped || 0);
   const progress = job.total ? Math.round(finished * 100 / job.total) : 0;
   if (job.concurrency) $('#download-concurrency').value = String(Math.min(10, Math.max(1, job.concurrency)));
@@ -535,10 +627,11 @@ function renderDownloadJob(job) {
   const label = job.status === 'completed' ? `${taskLabel}完成` : job.status === 'completed_with_errors' ? `${taskLabel}完成（有失败项）` : job.status === 'failed' ? `${taskLabel}失败` : job.status === 'cancelled' ? `${taskLabel}已取消` : taskLabel;
   $('#download-title').textContent = label;
   const activeConcurrency = Number(job.activeConcurrency || 0);
-  $('#download-summary').textContent = `${finished}/${job.total} 个作品 · 成功 ${job.completed} · 跳过 ${job.skipped} · 失败 ${job.failed} · 实际并发 ${activeConcurrency}/${job.concurrency}`;
+  const activeItems = Array.isArray(job.activeItems) ? job.activeItems : [];
+  const totalSpeed = job.status === 'running' ? activeItems.reduce((sum, item) => sum + (Number(item.speedBps) || 0), 0) : 0;
+  $('#download-summary').textContent = `总速度 ${formatSpeed(totalSpeed)} · ${finished}/${job.total} 个作品 · 成功 ${job.completed} · 跳过 ${job.skipped} · 失败 ${job.failed} · 实际并发 ${activeConcurrency}/${job.concurrency}`;
   $('#download-progress-value').style.width = `${progress}%`;
   $('#download-detail').textContent = job.error || `并发 ${job.concurrency}（当前 ${activeConcurrency}） · 保存到 ${job.directory}`;
-  const activeItems = Array.isArray(job.activeItems) ? job.activeItems : [];
   $('#download-active-list').innerHTML = activeItems.map(item => {
     const percent = item.totalBytes ? Math.min(100, Math.round(item.bytes * 100 / item.totalBytes)) : 0;
     const type = item.mediaType === 'image' ? `${item.livePhotoCount ? '实况图集' : '图集'}${item.totalImages ? ` ${item.completedImages || 0}/${item.totalImages} 张` : ''}` : '视频';
@@ -1152,21 +1245,27 @@ async function pollSync() {
 }
 
 async function pollUserSync() {
-  const response = await fetch('/api/profile/sync/status');
-  const sync = await response.json();
-  $('#status').textContent = sync.error || sync.message;
-  $('#progress-value').style.width = `${sync.progress || 0}%`;
-  $('#progress-detail').textContent = sync.running ? `${sync.progress || 0}% · 已发现 ${sync.count || 0} 条作品` : '';
-  $('#sync-status-close').hidden = sync.running;
-  if (sync.running) return setTimeout(pollUserSync, 500);
-  $('#profile-sync-start').disabled = false;
-  if (sync.error) { $('#status').classList.add('error'); return; }
-  if (Array.isArray(sync.data)) {
-    state.user = sync.data;
-    state.source = 'user';
-    document.querySelectorAll('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.source === 'user'));
-    resetPageAndRender();
-    $('#status').textContent = `用户作品加载完成：${state.user.length} 条`;
+  try {
+    const response = await fetch('/api/profile/sync/status');
+    const sync = await response.json();
+    if (!response.ok) throw new Error(sync.error || '获取用户作品加载状态失败');
+    $('#user-status').textContent = sync.error || sync.message;
+    $('#user-progress-value').style.width = `${sync.progress || 0}%`;
+    $('#user-progress-detail').textContent = sync.running ? `${sync.progress || 0}% · 已发现 ${sync.count || 0} 条作品` : '';
+    $('#user-sync-status-close').hidden = sync.running;
+    if (sync.running) return setTimeout(pollUserSync, 500);
+    $('#profile-sync-start').disabled = false;
+    if (sync.error) { $('#user-status').classList.add('error'); return; }
+    if (Array.isArray(sync.data)) {
+      state.user = sync.data;
+      if (state.source === 'user') resetPageAndRender();
+      $('#user-status').textContent = `用户作品加载完成：${state.user.length} 条`;
+    }
+  } catch (error) {
+    $('#profile-sync-start').disabled = false;
+    $('#user-status').textContent = error.message;
+    $('#user-status').classList.add('error');
+    $('#user-sync-status-close').hidden = false;
   }
 }
 
@@ -1239,6 +1338,7 @@ $('.tabs').addEventListener('click', event => {
   const tab = event.target.closest('.tab');
   if (!tab) return;
   state.source = tab.dataset.source;
+  lastLibrarySource = state.source;
   document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab));
   resetPageAndRender();
 });
@@ -1369,19 +1469,21 @@ $('#profile-sync-start').addEventListener('click', async () => {
   button.disabled = true;
   $('#profile-sync-error').textContent = '';
   $('#profile-sync-modal').close();
-  $('#sync-status').hidden = false;
-  $('#progress-track').hidden = false;
-  $('#progress-value').style.width = '0%';
-  $('#sync-status-close').hidden = true;
-  $('#status').classList.remove('error');
+  $('#user-sync-status').hidden = false;
+  $('#user-progress-track').hidden = false;
+  $('#user-progress-value').style.width = '0%';
+  $('#user-progress-detail').textContent = '';
+  $('#user-sync-status-close').hidden = true;
+  $('#user-status').classList.remove('error');
   try {
     const response = await fetch('/api/profile/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: url.href }) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '启动用户作品加载失败');
     pollUserSync();
   } catch (error) {
-    $('#status').textContent = error.message;
-    $('#status').classList.add('error');
+    $('#user-status').textContent = error.message;
+    $('#user-status').classList.add('error');
+    $('#user-sync-status-close').hidden = false;
     button.disabled = false;
   }
 });
@@ -1389,6 +1491,7 @@ $('#profile-sync-url').addEventListener('keydown', event => {
   if (event.key === 'Enter') $('#profile-sync-start').click();
 });
 $('#sync-status-close').addEventListener('click', () => { $('#sync-status').hidden = true; });
+$('#user-sync-status-close').addEventListener('click', () => { $('#user-sync-status').hidden = true; });
 $('#download-status-close').addEventListener('click', () => {
   rememberDismissedDownloadJob(downloadJob);
   $('#download-status').hidden = true;
@@ -1413,8 +1516,9 @@ async function restoreLatest() {
       render();
     }
     if (profileSync.running) {
-      $('#sync-status').hidden = false;
-      $('#progress-track').hidden = false;
+      $('#profile-sync-start').disabled = true;
+      $('#user-sync-status').hidden = false;
+      $('#user-progress-track').hidden = false;
       pollUserSync();
     }
     const jobs = await (await fetch('/api/download/jobs?summary=1')).json();

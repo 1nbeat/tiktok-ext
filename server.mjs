@@ -169,6 +169,40 @@ async function sendDownloadedFile(res, name) {
   try { await pipeline(createReadStream(filePath), res); } catch { res.destroy(); }
 }
 
+let deletingDownloadedFiles = false;
+
+async function deleteDownloadedFile(name) {
+  if (typeof name !== 'string' || !name || name.includes('\\') || name.split('/').some(part => !part || part === '.' || part === '..') || /\.(part|tmp)$/i.test(name)) {
+    const error = new Error('无效的文件路径'); error.status = 400; throw error;
+  }
+  const rootPath = await fs.realpath(downloadRoot);
+  const requested = path.resolve(downloadRoot, ...name.split('/'));
+  const entry = await fs.lstat(requested);
+  if (!entry.isFile()) { const error = new Error('文件不存在'); error.status = 404; throw error; }
+  const filePath = await fs.realpath(requested);
+  if (!filePath.startsWith(rootPath + path.sep)) { const error = new Error('无效的文件路径'); error.status = 403; throw error; }
+  await fs.unlink(filePath);
+}
+
+async function deleteAllDownloadedFiles() {
+  let deleted = 0;
+  async function visit(directory) {
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for (const entry of entries) {
+      const filePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(filePath);
+      else if (entry.isFile() && !/\.(part|tmp)$/i.test(entry.name)) {
+        await fs.unlink(filePath);
+        deleted++;
+      }
+    }
+  }
+  await visit(downloadRoot);
+  return deleted;
+}
+
 async function cdpCall(ws, method, params = {}, timeoutMs = 20000) {
   // 通过 WebSocket 向 Chrome 发送 CDP 命令，并等待对应响应。
   const id = ++ws.nextId;
@@ -838,6 +872,7 @@ let detailFallbackQueue = Promise.resolve();
 const mediaUrls = new Map();
 
 const downloadJobs = new Map();
+let downloadRunsInFlight = 0;
 const downloadProgressSavedAt = new WeakMap();
 let downloadStateWrite = Promise.resolve();
 let downloadStateTimer = null;
@@ -879,6 +914,7 @@ function publicDownloadJob(job, { includeItems = true } = {}) {
     imageCount: job.items.filter(item => item.mediaType === 'image').length,
     directory: downloadRoot,
     total: job.items.length,
+    fileVersion: Number(job.fileVersion) || 0,
     completed: job.items.filter(item => item.status === 'completed').length,
     skipped: job.items.filter(item => item.status === 'skipped').length,
     failed: job.items.filter(item => item.status === 'failed').length,
@@ -1165,6 +1201,7 @@ async function downloadJobItem(job, item) {
         return;
       }
       await fs.rename(partial, target);
+      job.fileVersion = (Number(job.fileVersion) || 0) + 1;
       item.status = 'completed';
       item.totalBytes = item.bytes;
       updateDownloadJob(job);
@@ -1276,6 +1313,7 @@ async function downloadImageAlbumItem(job, item) {
         }
         if (stopIfInactive()) return;
         await fs.rename(partial, target);
+        job.fileVersion = (Number(job.fileVersion) || 0) + 1;
         item.totalBytes = item.bytes;
         item.completedFiles += 1;
         if (file.endsImage) item.completedImages += 1;
@@ -1329,11 +1367,12 @@ function startDownloadJob(job) {
   const runToken = job.runToken;
   updateDownloadJob(job);
   const previousRun = job.runningPromise || Promise.resolve();
+  downloadRunsInFlight++;
   job.runningPromise = previousRun.catch(() => {}).then(() => runDownloadJob(job, runToken)).catch(error => {
     job.status = 'failed';
     job.error = error.message;
     updateDownloadJob(job);
-  });
+  }).finally(() => { downloadRunsInFlight--; });
 }
 
 // 直接复用已登录的抖音个人页请求详情接口，避免重新加载完整视频页。
@@ -2249,6 +2288,7 @@ const server = http.createServer(async (req, res) => {
         concurrency: Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(1, Math.round(Number(body.concurrency) || DOWNLOAD_CONCURRENCY))),
         skipExisting: body.skipExisting !== false, cancelRequested: false, error: null, items
       };
+      if (deletingDownloadedFiles) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候再开始下载' }));
       downloadJobs.set(job.id, job);
       await queueDownloadStateSave();
       startDownloadJob(job);
@@ -2256,6 +2296,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (requestUrl.pathname === '/api/download/files' && req.method === 'GET') {
       return send(res, 200, JSON.stringify(await listDownloadedFiles()));
+    }
+    if (requestUrl.pathname === '/api/download/files' && req.method === 'DELETE') {
+      if (deletingDownloadedFiles) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候' }));
+      if (downloadRunsInFlight || [...downloadJobs.values()].some(job => ['running', 'pending'].includes(job.status) || job.items.some(item => item.status === 'downloading'))) {
+        return send(res, 409, JSON.stringify({ error: '请先暂停下载并等待当前文件停止后再删除' }));
+      }
+      deletingDownloadedFiles = true;
+      try {
+        const body = await readJsonBody(req);
+        if (body.all === true) return send(res, 200, JSON.stringify({ deleted: await deleteAllDownloadedFiles() }));
+        await deleteDownloadedFile(body.path);
+        return send(res, 200, JSON.stringify({ deleted: 1 }));
+      } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return send(res, 404, JSON.stringify({ error: '文件不存在' }));
+        if (error.status) return send(res, error.status, JSON.stringify({ error: error.message }));
+        throw error;
+      } finally { deletingDownloadedFiles = false; }
     }
     if (requestUrl.pathname === '/api/download/file' && req.method === 'GET') {
       return sendDownloadedFile(res, requestUrl.searchParams.get('path'));
@@ -2276,6 +2333,7 @@ const server = http.createServer(async (req, res) => {
       const [, id, action] = match;
       const job = downloadJobs.get(id);
       if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
+      if (deletingDownloadedFiles && ['resume', 'retry-failed'].includes(action)) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候再继续下载' }));
       if (['resume', 'retry-failed'].includes(action) && (job.accountId || 'default') !== activeAccountId) return send(res, 409, JSON.stringify({ error: '请先切换到创建此任务的账号' }));
       if (action === 'pause') {
         if (job.status === 'running') job.status = 'paused';

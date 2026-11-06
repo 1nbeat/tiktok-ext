@@ -52,10 +52,11 @@ test('user sync preserves a tab that was already open', async () => {
 test('download summaries omit the item list while retaining progress', () => {
   const context = vm.createContext({ MAX_DOWNLOAD_CONCURRENCY: 10, DOWNLOAD_CONCURRENCY: 2, downloadRoot: '/downloads' });
   vm.runInContext(source.slice(source.indexOf('function publicDownloadJob('), source.indexOf('async function loadDownloadJobs(')), context);
-  const job = { id: 'job', status: 'running', items: [{ id: '1', status: 'downloading', mediaType: 'video', bytes: 10 }] };
+  const job = { id: 'job', status: 'running', fileVersion: 3, items: [{ id: '1', status: 'downloading', mediaType: 'video', bytes: 10 }] };
   const summary = context.publicDownloadJob(job, { includeItems: false });
   assert.equal(summary.total, 1);
   assert.equal(summary.bytes, 10);
+  assert.equal(summary.fileVersion, 3);
   assert.equal(summary.activeItems.length, 1);
   assert.equal('items' in summary, false);
   assert.equal(context.publicDownloadJob(job).items.length, 1);
