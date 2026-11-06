@@ -6,14 +6,22 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import { createWriteStream } from 'node:fs';
+import { ZipArchive } from 'archiver';
 import { createAccessControl } from './access.mjs';
 import { createLibrary } from './library.mjs';
+import { createLogger } from './logger.mjs';
 
 // 静态页面目录和本地服务端口；服务只在本机提供访问。
 const root = path.resolve('public');
 const port = Number(process.env.PORT || 9001);
 const host = process.env.HOST || '127.0.0.1';
-const access = await createAccessControl(path.resolve(process.env.ACCESS_CONFIG || 'config.json'));
+const logger = createLogger(path.resolve('logs'));
+logger.log('info', 'server.starting', { node: process.version, platform: process.platform });
+let access;
+try { access = await createAccessControl(path.resolve(process.env.ACCESS_CONFIG || 'config.json')); }
+catch (error) { logger.log('error', 'server.config.failed', { error: error.message }); await logger.read(); throw error; }
 const library = createLibrary(path.resolve('library.sqlite'));
 const downloadRoot = path.resolve('downloads');
 const downloadStatePath = path.resolve('download-state.json');
@@ -872,6 +880,8 @@ let detailFallbackQueue = Promise.resolve();
 const mediaUrls = new Map();
 
 const downloadJobs = new Map();
+const downloadArchives = new Map();
+let archiveInProgress = false;
 let downloadRunsInFlight = 0;
 const downloadProgressSavedAt = new WeakMap();
 let downloadStateWrite = Promise.resolve();
@@ -899,7 +909,7 @@ function queueDownloadStateSave() {
 
 function publicDownloadJob(job, { includeItems = true } = {}) {
   // 只向前端暴露任务进度字段，隐藏运行时 Promise 和媒体地址缓存。
-  const exposeItem = ({ rateAt, rateBytes, playUrl, qualities, images, imageMedia, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
+  const exposeItem = ({ rateAt, rateBytes, playUrl, qualities, images, imageMedia, outputFiles, ...item }) => ({ ...item, speedBps: Number(item.speedBps) || 0 });
   return {
     id: job.id,
     status: job.status,
@@ -1039,14 +1049,113 @@ function safeDownloadTitle(title, id) {
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/[. ]+$/g, '')
-    .slice(0, 120)
     .replace(/[. ]+$/g, '');
+  let shortened = '';
+  let bytes = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, 'utf8');
+    if (bytes + size > 200) break;
+    shortened += character;
+    bytes += size;
+  }
+  value = shortened.replace(/[. ]+$/g, '');
   if (!value || /^\.+$/.test(value) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) return fallback;
   return value;
 }
 
+function prepareFailedDownloads(job) {
+  const used = new Set(job.items.filter(item => item.fileBaseName).map(item => item.fileBaseName.toLowerCase()));
+  for (const item of job.items) {
+    if (item.status !== 'failed') continue;
+    if (/ENAMETOOLONG/.test(item.error || '')) {
+      const title = safeDownloadTitle(item.fileBaseName || item.title, item.id);
+      const suffix = String(item.id || '').replace(/[^0-9]/g, '') || 'media';
+      let name = `${title}-${suffix}`;
+      let index = 1;
+      while (used.has(name.toLowerCase())) name = `${title}-${suffix}-${++index}`;
+      item.fileBaseName = name;
+      used.add(name.toLowerCase());
+    }
+    item.status = 'pending';
+  }
+}
+
 function safeFileName(item) {
   return `${item.fileBaseName || safeDownloadTitle(item.title, item.id)}.mp4`;
+}
+
+function rememberOutputFile(item, filename) {
+  const relative = path.relative(downloadRoot, filename).split(path.sep).join('/');
+  item.outputFiles ||= [];
+  if (!item.outputFiles.includes(relative)) item.outputFiles.push(relative);
+}
+
+async function getJobOutputFiles(job) {
+  if (!['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(job.status) || downloadRunsInFlight) throw new Error('请等待下载任务停止后再保存');
+  const paths = new Set();
+  for (const item of job.items) {
+    if (Array.isArray(item.outputFiles)) {
+      for (const name of item.outputFiles) paths.add(name);
+    } else if (['completed', 'skipped'].includes(item.status)) {
+      if (item.mediaType !== 'image') paths.add(safeFileName(item));
+      else {
+        const count = Number(item.totalImages) || item.imageMedia?.length || item.images?.length || 0;
+        const directory = job.albumMode === 'flat' ? '' : `${safeAlbumDirectory(item.id)}/`;
+        for (let index = 1; index <= count; index++) {
+          for (const extension of ['jpg', 'mp4']) paths.add(`${directory}${item.fileBaseName || safeDownloadTitle(item.title, item.id)}-${index}.${extension}`);
+        }
+      }
+    }
+  }
+  let root;
+  try { root = await fs.realpath(downloadRoot); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const files = [];
+  for (const name of paths) {
+    if (typeof name !== 'string' || !name || name.includes('\\') || name.split('/').some(part => !part || part === '.' || part === '..') || /\.(part|tmp)$/i.test(name)) continue;
+    try {
+      const requested = path.resolve(downloadRoot, ...name.split('/'));
+      const entry = await fs.lstat(requested);
+      if (!entry.isFile()) continue;
+      const resolved = await fs.realpath(requested);
+      if (!resolved.startsWith(root + path.sep)) continue;
+      files.push({ path: name, size: entry.size, resolved });
+    } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+  }
+  return files;
+}
+
+async function createJobArchive(job, state) {
+  let directory;
+  try {
+    const files = await getJobOutputFiles(job);
+    if (!files.length) throw new Error('任务中没有可保存的文件');
+    state.total = files.length;
+    directory = await fs.mkdtemp(path.join(os.tmpdir(), 'douyin-export-'));
+    const filename = path.join(directory, 'download.zip');
+    const output = createWriteStream(filename, { flags: 'wx' });
+    const archive = new ZipArchive({ store: true, forceZip64: true });
+    archive.on('progress', progress => { state.processed = progress.entries.processed; });
+    archive.on('warning', error => archive.destroy(error));
+    for (const file of files) archive.file(file.resolved, { name: file.path });
+    const finished = pipeline(archive, output);
+    await Promise.all([finished, archive.finalize()]);
+    state.path = filename;
+    state.directory = directory;
+    state.status = 'ready';
+  } catch (error) {
+    state.status = 'failed';
+    state.error = error.message;
+    logger.log('error', 'archive.failed', { job: job.id, error: error.message });
+    if (directory) await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+  } finally {
+    if (state.status === 'ready') logger.log('info', 'archive.ready', { job: job.id, files: state.total });
+    archiveInProgress = false;
+    const cleanup = setTimeout(async () => {
+      downloadArchives.delete(state.id);
+      if (directory) await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+    }, 60 * 60 * 1000);
+    cleanup.unref();
+  }
 }
 
 function updateDownloadRate(item, bytesAdded) {
@@ -1127,6 +1236,7 @@ async function downloadJobItem(job, item) {
     try {
       const stat = await fs.stat(target);
       if (stat.size > 0) {
+        rememberOutputFile(item, target);
         item.bytes = stat.size;
         item.totalBytes = stat.size;
         item.status = 'skipped';
@@ -1201,6 +1311,7 @@ async function downloadJobItem(job, item) {
         return;
       }
       await fs.rename(partial, target);
+      rememberOutputFile(item, target);
       job.fileVersion = (Number(job.fileVersion) || 0) + 1;
       item.status = 'completed';
       item.totalBytes = item.bytes;
@@ -1214,6 +1325,7 @@ async function downloadJobItem(job, item) {
     }
   }
   item.status = 'failed';
+  logger.log('error', 'download.item.failed', { job: job.id, work: item.id, error: item.error });
   updateDownloadJob(job);
 }
 
@@ -1266,6 +1378,7 @@ async function downloadImageAlbumItem(job, item) {
           try {
             const stat = await fs.stat(target);
             if (stat.size > 0) {
+              rememberOutputFile(item, target);
               item.bytes += stat.size;
               item.totalBytes += stat.size;
               item.completedFiles += 1;
@@ -1313,6 +1426,7 @@ async function downloadImageAlbumItem(job, item) {
         }
         if (stopIfInactive()) return;
         await fs.rename(partial, target);
+        rememberOutputFile(item, target);
         job.fileVersion = (Number(job.fileVersion) || 0) + 1;
         item.totalBytes = item.bytes;
         item.completedFiles += 1;
@@ -1330,6 +1444,7 @@ async function downloadImageAlbumItem(job, item) {
     }
   }
   item.status = 'failed';
+  logger.log('error', 'download.item.failed', { job: job.id, work: item.id, error: item.error });
   updateDownloadJob(job);
 }
 
@@ -1355,6 +1470,7 @@ async function runDownloadJob(job, runToken) {
   if (job.runToken !== runToken) return;
   if (job.cancelRequested) job.status = 'cancelled';
   else if (job.status === 'running') job.status = job.items.some(item => item.status === 'failed') ? 'completed_with_errors' : 'completed';
+  logger.log('info', 'download.finished', { job: job.id, status: job.status, failed: job.items.filter(item => item.status === 'failed').length });
   updateDownloadJob(job);
 }
 
@@ -1371,6 +1487,7 @@ function startDownloadJob(job) {
   job.runningPromise = previousRun.catch(() => {}).then(() => runDownloadJob(job, runToken)).catch(error => {
     job.status = 'failed';
     job.error = error.message;
+    logger.log('error', 'download.failed', { job: job.id, error: error.message });
     updateDownloadJob(job);
   }).finally(() => { downloadRunsInFlight--; });
 }
@@ -2118,6 +2235,7 @@ function startSync() {
   // 防止重复启动同步，并在后台任务完成后更新最新数据缓存。
   if (syncState.running) return;
   const accountId = activeAccountId;
+  logger.log('info', 'sync.started', { account: accountId });
   const checkpoints = library.begin(accountId);
   syncState = { running: true, progress: 0, phase: 'like', message: '正在连接抖音页面', likePages: checkpoints.like.pages, collectPages: checkpoints.collect.pages, version: 0, error: null };
   syncFromChrome(accountId, checkpoints, update => {
@@ -2128,22 +2246,27 @@ function startSync() {
     }
     if (update.phase) Object.assign(syncState, update);
   }).then(data => {
+    logger.log('info', 'sync.finished', { account: accountId, complete: data.complete, likePages: syncState.likePages, collectPages: syncState.collectPages });
     syncState = { ...syncState, running: false, progress: data.complete ? 100 : syncState.progress, phase: data.complete ? 'done' : 'partial', partial: !data.complete, message: data.complete ? '同步完成' : '已保存部分作品，接口未完整同步，可再次尝试继续', syncedAt: data.syncedAt };
   }).catch(error => {
+    logger.log('error', 'sync.failed', { account: accountId, error: error.message });
     syncState = { ...syncState, running: false, message: '同步失败', error: error.message };
   });
 }
 
 function startUserSync(profileUrl) {
   if (userSyncState.running) return;
+  logger.log('info', 'profile_sync.started', { account: activeAccountId });
   userSyncState = { running: true, progress: 0, pages: 0, count: 0, message: '正在连接用户主页', profileUrl, error: null };
   syncUserFromChrome(profileUrl, update => {
     userSyncState = { ...userSyncState, ...update };
   }).then(data => {
+    logger.log('info', 'profile_sync.finished', { count: data.items.length });
     latestData.user = data.items;
     latestData.userProfileUrl = data.profileUrl;
     userSyncState = { ...userSyncState, running: false, progress: 100, count: data.items.length, message: `用户作品加载完成：${data.items.length} 条` };
   }).catch(error => {
+    logger.log('error', 'profile_sync.failed', { error: error.message });
     userSyncState = { ...userSyncState, running: false, message: '用户作品加载失败', error: error.message };
   });
 }
@@ -2153,6 +2276,11 @@ const server = http.createServer(async (req, res) => {
     // 启动和查询同步状态的 API；静态文件请求在下面统一处理。
     const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (await access(req, res, requestUrl)) return;
+    if (requestUrl.pathname === '/api/system/log' && req.method === 'GET') {
+      const content = await logger.read();
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...(requestUrl.searchParams.get('download') === '1' ? { 'content-disposition': 'attachment; filename="douyin-system.log"' } : {}) });
+      return res.end(content);
+    }
     if (accountSwitching && requestUrl.pathname.startsWith('/api/')) return send(res, 409, JSON.stringify({ error: '正在处理账号，请稍候' }));
     if (pendingAccount && requestUrl.pathname.startsWith('/api/') && !requestUrl.pathname.startsWith('/api/accounts/pending') && requestUrl.pathname !== '/api/accounts' && !requestUrl.pathname.startsWith('/api/video/stream')) return send(res, 409, JSON.stringify({ error: '请先完成或取消添加账号' }));
     if (requestUrl.pathname === '/api/accounts' && req.method === 'GET') {
@@ -2200,7 +2328,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (requestUrl.pathname === '/api/accounts/switch' && req.method === 'POST') {
       const { id } = await readJsonBody(req);
+      const started = Date.now();
       await switchAccount(id);
+      logger.log('info', 'account.switched', { account: id, durationMs: Date.now() - started });
       return send(res, 200, JSON.stringify({ activeAccountId, accounts }));
     }
     if (requestUrl.pathname === '/api/login/status' && req.method === 'GET') {
@@ -2288,8 +2418,9 @@ const server = http.createServer(async (req, res) => {
         concurrency: Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(1, Math.round(Number(body.concurrency) || DOWNLOAD_CONCURRENCY))),
         skipExisting: body.skipExisting !== false, cancelRequested: false, error: null, items
       };
-      if (deletingDownloadedFiles) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候再开始下载' }));
+      if (deletingDownloadedFiles || archiveInProgress) return send(res, 409, JSON.stringify({ error: '正在处理文件，请稍候再开始下载' }));
       downloadJobs.set(job.id, job);
+      logger.log('info', 'download.started', { job: job.id, source: job.source, items: job.items.length, concurrency: job.concurrency });
       await queueDownloadStateSave();
       startDownloadJob(job);
       return send(res, 202, JSON.stringify(publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' })));
@@ -2298,7 +2429,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, JSON.stringify(await listDownloadedFiles()));
     }
     if (requestUrl.pathname === '/api/download/files' && req.method === 'DELETE') {
-      if (deletingDownloadedFiles) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候' }));
+      if (deletingDownloadedFiles || archiveInProgress) return send(res, 409, JSON.stringify({ error: '正在处理文件，请稍候' }));
       if (downloadRunsInFlight || [...downloadJobs.values()].some(job => ['running', 'pending'].includes(job.status) || job.items.some(item => item.status === 'downloading'))) {
         return send(res, 409, JSON.stringify({ error: '请先暂停下载并等待当前文件停止后再删除' }));
       }
@@ -2317,6 +2448,38 @@ const server = http.createServer(async (req, res) => {
     if (requestUrl.pathname === '/api/download/file' && req.method === 'GET') {
       return sendDownloadedFile(res, requestUrl.searchParams.get('path'));
     }
+    const jobFilesMatch = requestUrl.pathname.match(/^\/api\/download\/jobs\/([^/]+)\/files$/);
+    if (jobFilesMatch && req.method === 'GET') {
+      const job = downloadJobs.get(jobFilesMatch[1]);
+      if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
+      try {
+        const files = await getJobOutputFiles(job);
+        return send(res, 200, JSON.stringify({ files: files.map(({ path: name, size }) => ({ path: name, size })) }));
+      } catch (error) { return send(res, 409, JSON.stringify({ error: error.message })); }
+    }
+    const jobArchiveMatch = requestUrl.pathname.match(/^\/api\/download\/jobs\/([^/]+)\/archive$/);
+    if (jobArchiveMatch && req.method === 'POST') {
+      const job = downloadJobs.get(jobArchiveMatch[1]);
+      if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
+      if (archiveInProgress || deletingDownloadedFiles || downloadRunsInFlight || ['running', 'pending', 'paused'].includes(job.status)) return send(res, 409, JSON.stringify({ error: '请等待下载或其他文件操作完成后再打包' }));
+      const state = { id: randomUUID(), status: 'packing', processed: 0, total: 0 };
+      logger.log('info', 'archive.started', { job: job.id });
+      archiveInProgress = true;
+      downloadArchives.set(state.id, state);
+      createJobArchive(job, state);
+      return send(res, 202, JSON.stringify({ id: state.id, status: state.status }));
+    }
+    const archiveMatch = requestUrl.pathname.match(/^\/api\/download\/archives\/([a-f0-9-]+)(\/file)?$/);
+    if (archiveMatch && req.method === 'GET') {
+      const state = downloadArchives.get(archiveMatch[1]);
+      if (!state) return send(res, 404, JSON.stringify({ error: '打包任务不存在或已过期' }));
+      if (!archiveMatch[2]) return send(res, 200, JSON.stringify({ id: state.id, status: state.status, processed: state.processed, total: state.total, error: state.error || null }));
+      if (state.status !== 'ready') return send(res, 409, JSON.stringify({ error: '压缩包尚未准备好' }));
+      const stat = await fs.stat(state.path);
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': stat.size, 'content-disposition': `attachment; filename="douyin-${state.id}.zip"`, 'cache-control': 'no-store' });
+      try { await pipeline(createReadStream(state.path), res); } catch { res.destroy(); }
+      return;
+    }
     if (requestUrl.pathname === '/api/download/jobs' && req.method === 'GET') {
       const jobs = [...downloadJobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
       return send(res, 200, JSON.stringify(jobs.slice(0, 20).map(job => publicDownloadJob(job, { includeItems: requestUrl.searchParams.get('summary') !== '1' }))));
@@ -2333,13 +2496,14 @@ const server = http.createServer(async (req, res) => {
       const [, id, action] = match;
       const job = downloadJobs.get(id);
       if (!job) return send(res, 404, JSON.stringify({ error: '下载任务不存在' }));
-      if (deletingDownloadedFiles && ['resume', 'retry-failed'].includes(action)) return send(res, 409, JSON.stringify({ error: '正在删除文件，请稍候再继续下载' }));
+      logger.log('info', 'download.action', { job: id, action });
+      if ((deletingDownloadedFiles || archiveInProgress) && ['resume', 'retry-failed'].includes(action)) return send(res, 409, JSON.stringify({ error: '正在处理文件，请稍候再继续下载' }));
       if (['resume', 'retry-failed'].includes(action) && (job.accountId || 'default') !== activeAccountId) return send(res, 409, JSON.stringify({ error: '请先切换到创建此任务的账号' }));
       if (action === 'pause') {
         if (job.status === 'running') job.status = 'paused';
       } else if (action === 'resume') {
         if (['paused', 'pending', 'failed', 'completed_with_errors'].includes(job.status)) {
-          for (const item of job.items) if (item.status === 'failed') item.status = 'pending';
+          prepareFailedDownloads(job);
           startDownloadJob(job);
         }
       } else if (action === 'cancel') {
@@ -2348,7 +2512,7 @@ const server = http.createServer(async (req, res) => {
         for (const item of job.items) if (item.status === 'downloading' || item.status === 'pending') item.status = 'cancelled';
         updateDownloadJob(job);
       } else if (action === 'retry-failed') {
-        for (const item of job.items) if (item.status === 'failed') item.status = 'pending';
+        prepareFailedDownloads(job);
         startDownloadJob(job);
       }
       updateDownloadJob(job);
@@ -2399,14 +2563,17 @@ const server = http.createServer(async (req, res) => {
     const data = await fs.readFile(file);
     const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : file.endsWith('.svg') ? 'image/svg+xml' : 'text/css; charset=utf-8';
     send(res, 200, data, type);
-  } catch (error) { send(res, 500, JSON.stringify({ error: error.message })); }
+  } catch (error) { logger.log('error', 'request.failed', { method: req.method, error: error.message }); if (!res.headersSent) send(res, 500, JSON.stringify({ error: error.message })); else res.destroy(); }
 });
-await loadAccounts();
-for (const account of accounts) {
-  if (account.id === activeAccountId) continue;
-  const endpoint = await existingAccountEndpoint(account.id);
-  if (endpoint) await closeAccountBrowser(account.id, endpoint).catch(error => console.error(`关闭闲置账号浏览器失败：${error.message}`));
-}
-activeCdp = await accountEndpoint(activeAccountId);
-await loadDownloadJobs();
-server.listen(port, host, () => console.log(`Douyin Library Viewer: http://${host}:${port}`));
+try {
+  await loadAccounts();
+  for (const account of accounts) {
+    if (account.id === activeAccountId) continue;
+    const endpoint = await existingAccountEndpoint(account.id);
+    if (endpoint) await closeAccountBrowser(account.id, endpoint).catch(error => { logger.log('warn', 'browser.cleanup.failed', { account: account.id, error: error.message }); console.error(`关闭闲置账号浏览器失败：${error.message}`); });
+  }
+  activeCdp = await accountEndpoint(activeAccountId);
+  await loadDownloadJobs();
+} catch (error) { logger.log('error', 'server.start.failed', { error: error.message }); await logger.read(); throw error; }
+server.on('error', error => { logger.log('error', 'server.error', { error: error.message }); });
+server.listen(port, host, () => { logger.log('info', 'server.ready', { port }); console.log(`Douyin Library Viewer: http://${host}:${port}`); });

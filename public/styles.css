@@ -1114,6 +1114,13 @@ h1 {
   padding:34px 32px 28px
 }
 .action-confirm-modal #action-confirm-message { overflow-wrap:anywhere; white-space:pre-wrap }
+.export-options { display:grid; gap:10px; margin-top:20px }
+.export-options button { display:flex; flex-direction:column; align-items:flex-start; gap:5px; width:100%; padding:14px; border:1px solid #d7dde3; border-radius:6px; background:#fff; color:#20242a; text-align:left; cursor:pointer }
+.export-options button:hover:not(:disabled) { border-color:#d62d50 }
+.export-options button:disabled { opacity:.5; cursor:default }
+.export-options span { color:#77818a; font-size:12px }
+.export-download { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:0 14px; border-radius:6px; background:#e62e51; color:#fff; text-decoration:none; font-size:13px }
+.export-download[hidden], #export-progress-track[hidden] { display:none }
 .login-modal #login-qr {
   display:block;
   width:200px;
@@ -1821,6 +1828,8 @@ h1 {
 .sidebar-account-arrow { color:#aab0b5; font-size:20px }
 .shell { width:100%; max-width:1500px; min-width:0; margin:0 auto; padding:42px 44px 72px }
 .workspace-view[hidden] { display:none }
+.logs-content { min-height:240px; max-height:65vh; overflow:auto; margin:24px 0 0; padding:16px; border:1px solid #e0e4e7; border-radius:6px; background:#fff; color:#343a40; font:12px/1.6 Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere }
+.log-download { display:inline-flex; align-items:center; min-height:38px; padding:0 14px; border-radius:6px; background:#d62d50; color:#fff; font-size:13px; text-decoration:none }
 #work-content[hidden], .tabs[hidden] { display:none }
 .view-header { min-height:104px; display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding-bottom:27px; border-bottom:1px solid #e4e7e9 }
 .view-eyebrow { color:#b05b6d; font-size:10px; font-weight:700; letter-spacing:0 }

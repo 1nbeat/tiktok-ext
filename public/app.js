@@ -24,7 +24,7 @@ $('#action-confirm-modal').addEventListener('close', () => {
 });
 
 function showView(view) {
-  if (!['library', 'user', 'downloads', 'account'].includes(view)) return;
+  if (!['library', 'user', 'downloads', 'account', 'logs'].includes(view)) return;
   document.querySelectorAll('.workspace-view').forEach(section => { section.hidden = section.id !== `view-${view}`; });
   document.querySelectorAll('.nav-item').forEach(button => {
     const active = button.dataset.view === view;
@@ -50,12 +50,25 @@ function showView(view) {
     }
   }
   if (view === 'downloads') refreshDownloadedFiles();
+  if (view === 'logs') refreshSystemLogs();
 }
 $('.main-nav').addEventListener('click', event => {
   const button = event.target.closest('[data-view]');
   if (button) showView(button.dataset.view);
 });
 $('#sidebar-account').addEventListener('click', () => showView('account'));
+
+async function refreshSystemLogs() {
+  const message = $('#logs-message');
+  try {
+    const response = await fetch('/api/system/log');
+    if (!response.ok) throw new Error('无法读取系统日志');
+    const content = await response.text();
+    $('#logs-content').textContent = content || '暂无日志';
+    message.textContent = '';
+  } catch (error) { message.textContent = error.message; }
+}
+$('#logs-refresh').addEventListener('click', refreshSystemLogs);
 
 function renderSidebarAccount(profile, status) {
   const avatar = $('#sidebar-avatar');
@@ -598,6 +611,127 @@ function formatSpeed(value) {
   return `${(speed / 1024 ** 3).toFixed(2)} GB/s`;
 }
 
+let exportTargetId = '';
+let exportBusy = false;
+let exportAbort = null;
+let archiveExport = null;
+
+function openExportModal(job) {
+  if (!job || (exportBusy && exportTargetId !== job.id)) return;
+  const modal = $('#export-modal');
+  if (exportTargetId !== job.id || !exportBusy) {
+    exportTargetId = job.id;
+    $('#export-message').textContent = '选择保存方式';
+    $('#export-progress-track').hidden = true;
+    $('#export-progress-value').style.width = '0%';
+    $('#export-download').hidden = true;
+    if (archiveExport?.jobId === job.id && archiveExport.status === 'ready') {
+      $('#export-download').href = `/api/download/archives/${encodeURIComponent(archiveExport.id)}/file`;
+      $('#export-download').hidden = false;
+      $('#export-message').textContent = '压缩包已准备好';
+    }
+  }
+  const supported = typeof window.showDirectoryPicker === 'function' && window.isSecureContext;
+  $('#export-directory').disabled = exportBusy || !supported;
+  $('#export-directory span').textContent = supported ? '选择文件夹并保留目录结构' : '需要 HTTPS 和支持文件夹访问的桌面浏览器';
+  $('#export-zip').disabled = exportBusy;
+  if (!modal.open) modal.showModal();
+}
+
+function setExportBusy(busy, canStop = false) {
+  exportBusy = busy;
+  $('#export-zip').disabled = busy;
+  $('#export-directory').disabled = busy || typeof window.showDirectoryPicker !== 'function' || !window.isSecureContext;
+  $('#export-stop').hidden = !busy || !canStop;
+}
+
+async function startArchiveExport() {
+  if (exportBusy || !exportTargetId) return;
+  setExportBusy(true);
+  $('#export-download').hidden = true;
+  $('#export-progress-track').hidden = false;
+  $('#export-progress-value').style.width = '0%';
+  $('#export-message').textContent = '正在准备打包';
+  try {
+    const response = await fetch(`/api/download/jobs/${encodeURIComponent(exportTargetId)}/archive`, { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法开始打包');
+    archiveExport = { id: result.id, jobId: exportTargetId, status: 'packing' };
+    while (true) {
+      const progressResponse = await fetch(`/api/download/archives/${encodeURIComponent(result.id)}`);
+      const progress = await progressResponse.json();
+      if (!progressResponse.ok) throw new Error(progress.error || '无法获取打包进度');
+      if (progress.status === 'failed') throw new Error(progress.error || '打包失败');
+      $('#export-message').textContent = progress.status === 'ready' ? '压缩包已准备好' : `正在打包 ${progress.processed || 0}/${progress.total || 0} 个文件`;
+      $('#export-progress-value').style.width = `${progress.total ? Math.round((progress.processed || 0) * 100 / progress.total) : 0}%`;
+      if (progress.status === 'ready') break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    archiveExport.status = 'ready';
+    const link = $('#export-download');
+    link.href = `/api/download/archives/${encodeURIComponent(result.id)}/file`;
+    link.hidden = false;
+    if ($('#export-modal').open) link.click();
+  } catch (error) { $('#export-message').textContent = error.message; }
+  finally { setExportBusy(false); }
+}
+
+async function saveExportToDirectory() {
+  if (exportBusy || !exportTargetId) return;
+  const targetId = exportTargetId;
+  setExportBusy(true);
+  let directory;
+  try { directory = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+  catch (error) { if (error.name !== 'AbortError') $('#export-message').textContent = error.message; setExportBusy(false); return; }
+  setExportBusy(true, true);
+  exportAbort = new AbortController();
+  const signal = exportAbort.signal;
+  $('#export-progress-track').hidden = false;
+  $('#export-progress-value').style.width = '0%';
+  let saved = 0, skipped = 0, failed = 0;
+  try {
+    const response = await fetch(`/api/download/jobs/${encodeURIComponent(targetId)}/files`, { signal });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '无法获取任务文件');
+    if (!result.files.length) throw new Error('任务中没有可保存的文件');
+    for (const [index, file] of result.files.entries()) {
+      if (signal.aborted) throw new DOMException('已停止', 'AbortError');
+      $('#export-message').textContent = `正在保存 ${index + 1}/${result.files.length}：${file.path}`;
+      let parent = directory;
+      let created = false;
+      let name;
+      try {
+        const parts = file.path.split('/');
+        name = parts.pop();
+        for (const part of parts) parent = await parent.getDirectoryHandle(part, { create: true });
+        try { await parent.getFileHandle(name); skipped++; continue; }
+        catch (error) { if (error.name !== 'NotFoundError') throw error; }
+        const fileResponse = await fetch(`/api/download/file?path=${encodeURIComponent(file.path)}`, { signal });
+        if (!fileResponse.ok || !fileResponse.body) throw new Error('无法读取服务器文件');
+        const handle = await parent.getFileHandle(name, { create: true });
+        created = true;
+        const writable = await handle.createWritable();
+        await fileResponse.body.pipeTo(writable, { signal });
+        created = false;
+        saved++;
+      } catch (error) {
+        if (created) await parent.removeEntry(name).catch(() => {});
+        if (error.name === 'AbortError') throw error;
+        failed++;
+      } finally { $('#export-progress-value').style.width = `${Math.round((index + 1) * 100 / result.files.length)}%`; }
+    }
+    $('#export-message').textContent = `保存完成：成功 ${saved}，已存在 ${skipped}，失败 ${failed}`;
+  } catch (error) {
+    $('#export-message').textContent = error.name === 'AbortError' ? `已停止：成功 ${saved}，已存在 ${skipped}，失败 ${failed}` : error.message;
+  } finally { exportAbort = null; setExportBusy(false); }
+}
+
+$('#export-close').addEventListener('click', () => $('#export-modal').close());
+$('#export-zip').addEventListener('click', startArchiveExport);
+$('#export-directory').addEventListener('click', saveExportToDirectory);
+$('#export-stop').addEventListener('click', () => exportAbort?.abort());
+$('#download-export').addEventListener('click', () => openExportModal(downloadJob));
+
 function renderDownloadJob(job) {
   // 根据后台任务快照刷新总进度、并发状态和当前下载明细。
   downloadJob = job;
@@ -646,6 +780,7 @@ function renderDownloadJob(job) {
   $('#download-retry').hidden = job.failed === 0;
   $('#download-cancel').hidden = !running && !['paused', 'pending'].includes(job.status);
   $('#download-status-close').hidden = ['running', 'pending'].includes(job.status);
+  $('#download-export').hidden = !['completed', 'completed_with_errors', 'failed', 'cancelled'].includes(job.status);
 }
 
 async function pollDownloadJob(id) {
@@ -655,7 +790,9 @@ async function pollDownloadJob(id) {
     const response = await fetch(`/api/download/jobs/${encodeURIComponent(id)}?summary=1`);
     const job = await response.json();
     if (!response.ok) throw new Error(job.error || '获取下载任务失败');
+    const previous = downloadJob;
     renderDownloadJob(job);
+    if (previous?.id === job.id && ['running', 'pending'].includes(previous.status) && ['completed', 'completed_with_errors'].includes(job.status) && !$('#view-downloads').hidden && !document.querySelector('dialog[open]')) openExportModal(job);
     if (['running', 'pending'].includes(job.status)) downloadPollTimer = setTimeout(() => pollDownloadJob(id), 700);
   } catch (error) { $('#download-detail').textContent = error.message; }
 }
@@ -1522,7 +1659,7 @@ async function restoreLatest() {
       pollUserSync();
     }
     const jobs = await (await fetch('/api/download/jobs?summary=1')).json();
-    const active = jobs.find(job => ['running', 'pending', 'paused', 'failed', 'completed_with_errors'].includes(job.status) && !isDismissedDownloadJob(job));
+    const active = jobs.find(job => ['running', 'pending', 'paused', 'failed', 'completed_with_errors', 'completed', 'cancelled'].includes(job.status) && !isDismissedDownloadJob(job));
     if (active) {
       renderDownloadJob(active);
       if (['running', 'pending'].includes(active.status)) pollDownloadJob(active.id);
